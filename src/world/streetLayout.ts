@@ -14,10 +14,10 @@ export const STREET_CONFIG = {
   sidewalkHeight: 0.14,
   lotWidth: 46, // 46m along X to comfortably house 24x18m homes + 8m garages
   lotDepth: 56, // 56m along Z with deep front & back yards
-  lotSpacingX: 58, // 58m center-to-center (within 40-60m spec)
+  lotSpacingX: 56, // 56m center-to-center (within 40-60m spec)
   lotCenterZ: 35.5, // lots span ±7.5 .. ±63.5
   houseLocalOffsetZ: -2.0, // house center sits at ±37.5 (~21m front yard to sidewalk, ~17m backyard)
-  worldHalfWidth: 156,
+  worldHalfWidth: 214,
   worldHalfDepth: 112,
 } as const;
 
@@ -26,9 +26,17 @@ export interface StreetLayoutSpec {
   roadLength: number;
 }
 
-const ARCHETYPE_ORDER: HouseArchetypeId[] = [
-  'brick_colonial',
-  'craftsman_clapboard',
+const NORTH_ARCHETYPES: HouseArchetypeId[] = [
+  'tudor_manor',
+  'mediterranean_villa',
+  'craftsman_clapboard', // Gary's house (centerIdx = 2 when 8 lots)
+  'nordic_gable',
+];
+
+const SOUTH_ARCHETYPES: HouseArchetypeId[] = [
+  'industrial_loft',
+  'farmhouse_wrap',
+  'brick_colonial', // Player's house (centerIdx = 2 when 8 lots)
   'stucco_modern',
 ];
 
@@ -36,18 +44,18 @@ const ROOF_ACCESS_ORDER: RoofAccessMethod[] = [
   'exterior_ladder',
   'exterior_ladder',
   'exterior_ladder',
+  'exterior_ladder',
 ];
 
 /**
  * Generates a balanced data-driven neighborhood of `lotCount` (clamped 4..8, even) lots.
- * Default is 6 lots (3 north, 3 south), with player on south-center (`lot_s1`)
- * and primary idle AI neighbor directly across on north-center (`lot_n1`).
- * Each house varies in archetype, garage side (left/right), and muted color palette
- * so no two houses look identical.
+ * Default is 8 lots (4 north, 4 south) showcasing 8 genuinely distinct house architectures.
+ * Player (`slot_player`) and neighbor Gary (`slot_neighbor_1`) always sit directly opposite
+ * each other at `x = 0` so underground shelter portals remain perfectly aligned.
  */
 export function generateStreetLayout(
   seed: number,
-  lotCount: number = 6,
+  lotCount: number = 8,
 ): StreetLayoutSpec {
   const rng = new SeededRNG(seed ^ 0x51a7c0de);
   const clampedTotal = Math.max(4, Math.min(8, Math.round(lotCount / 2) * 2));
@@ -57,12 +65,18 @@ export function generateStreetLayout(
   const centerIdx = Math.floor(perSide / 2);
 
   for (let i = 0; i < perSide; i++) {
-    const x = (i - (perSide - 1) / 2) * STREET_CONFIG.lotSpacingX;
+    // Keep player & neighbor centerIdx pinned at x = 0 across 4, 6, and 8 lots!
+    const x = (i - centerIdx) * STREET_CONFIG.lotSpacingX;
+
+    // Ensure player & Gary retain classic contrasting archetypes across 4/6/8 lot configs
+    const archIdx = perSide === 4 ? i : (i - centerIdx + 2 + 4) % 4;
+    const northArchetype = NORTH_ARCHETYPES[archIdx % NORTH_ARCHETYPES.length];
+    const southArchetype = SOUTH_ARCHETYPES[archIdx % SOUTH_ARCHETYPES.length];
 
     // North side lot (faces +Z toward street)
-    const northArchetype = ARCHETYPE_ORDER[(i + 0) % ARCHETYPE_ORDER.length];
-    const northAccess = ROOF_ACCESS_ORDER[(i + 0) % ROOF_ACCESS_ORDER.length];
-    const northGarageSide: GarageSide = i % 2 === 0 ? 'right' : 'left';
+    const northAccess = ROOF_ACCESS_ORDER[i % ROOF_ACCESS_ORDER.length];
+    // Keep Gary's garage on 'left' (canonical -X -> world -11.2) matching player's garageSide='right' (rotated PI -> world -11.2)
+    const northGarageSide: GarageSide = i === centerIdx ? 'left' : i % 2 === 0 ? 'right' : 'left';
     lots.push({
       id: `lot_n${i}`,
       side: 'north',
@@ -76,9 +90,8 @@ export function generateStreetLayout(
     });
 
     // South side lot (faces -Z toward street)
-    const southArchetype = ARCHETYPE_ORDER[(i + 1) % ARCHETYPE_ORDER.length];
-    const southAccess = ROOF_ACCESS_ORDER[(i + 1) % ROOF_ACCESS_ORDER.length];
-    const southGarageSide: GarageSide = i % 2 === 0 ? 'left' : 'right';
+    const southAccess = ROOF_ACCESS_ORDER[i % ROOF_ACCESS_ORDER.length];
+    const southGarageSide: GarageSide = i === centerIdx ? 'right' : i % 2 === 0 ? 'left' : 'right';
     lots.push({
       id: `lot_s${i}`,
       side: 'south',
@@ -92,6 +105,6 @@ export function generateStreetLayout(
     });
   }
 
-  const roadLength = perSide * STREET_CONFIG.lotSpacingX + 80;
+  const roadLength = Math.max(300, perSide * STREET_CONFIG.lotSpacingX + 120);
   return { lots, roadLength };
 }

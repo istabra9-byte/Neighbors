@@ -4,8 +4,13 @@
  * and testable in headless Node.js.
  */
 
-import type { TunnelNetworkState } from '../tunnels/tunnelTypes';
+import type { TunnelNetworkState, TunnelToolId } from '../tunnels/tunnelTypes';
 import type { SocialPost } from '../events/eventTypes';
+import type {
+  Phase3State,
+  SerializedPhase3State,
+  WeaponId,
+} from '../phase3/phase3Types';
 
 export interface Vec3 {
   x: number;
@@ -79,7 +84,7 @@ export interface StairRamp {
 export interface LadderSpec {
   id: string;
   houseId: string;
-  kind: 'roof' | 'shelter';
+  kind: 'roof' | 'shelter' | 'tunnel_shaft';
   /** World X/Z centerline where the climbing character locks onto the rungs */
   climbX: number;
   climbZ: number;
@@ -111,7 +116,15 @@ export interface HeadroomVolume {
   passed: boolean;
 }
 
-export type HouseArchetypeId = 'brick_colonial' | 'craftsman_clapboard' | 'stucco_modern';
+export type HouseArchetypeId =
+  | 'brick_colonial'
+  | 'craftsman_clapboard'
+  | 'stucco_modern'
+  | 'tudor_manor'
+  | 'farmhouse_wrap'
+  | 'mediterranean_villa'
+  | 'nordic_gable'
+  | 'industrial_loft';
 export type RoofAccessMethod = 'exterior_ladder' | 'fire_escape';
 export type StreetSide = 'north' | 'south';
 export type GarageSide = 'left' | 'right';
@@ -139,7 +152,7 @@ export interface DoorEntity {
   ownerId: string;
   houseId: string;
   labelKey: string;
-  kind: 'front' | 'back' | 'garage' | 'roof' | 'interior';
+  kind: 'front' | 'back' | 'garage' | 'roof' | 'interior' | 'tunnel';
   /** World-space center position at floor level */
   position: Vec3;
   /** Facing yaw in radians */
@@ -168,6 +181,8 @@ export interface WindowEntity {
   isOpen: boolean;
   isBarricaded: boolean;
   damageState: DamageState;
+  /** Smoothly interpolated 0..1 casement swing open progress */
+  openProgress: number;
 }
 
 export type YardSlotKind =
@@ -233,7 +248,7 @@ export type ClimbPhase = 'opening_hatch' | 'mount' | 'climbing' | 'dismount';
 export interface ActorClimbState {
   ladderId: string;
   houseId: string;
-  kind: 'roof' | 'shelter';
+  kind: 'roof' | 'shelter' | 'tunnel_shaft';
   phase: ClimbPhase;
   /** 0..1 progress within mount, opening_hatch, or dismount sub-phase */
   phaseProgress: number;
@@ -290,18 +305,26 @@ export interface ActorEntity {
   maxHealth: number;
   stamina: number;
   maxStamina: number;
+  oxygen: number;
+  maxOxygen: number;
   money: number;
   animState: ActorAnimState;
   animTime: number;
   interactTimer: number;
+  digTimer: number;
   walkDistance: number;
   currentSurface: SurfaceKind;
   /** Active ladder / shelter hatch climbing state (null when walking freely) */
   climbState: ActorClimbState | null;
   /** Current house & floor for interior culling & 3P ceiling fade */
   insideHouseId: string | null;
-  currentFloor: number; // -1 shelter, 0 ground/outdoor, 1 second, 2 roof
+  currentFloor: number; // -2 deep tunnel, -1 shelter/tunnel, 0 ground/outdoor, 1 second, 2 roof
   inShelter: boolean;
+  inTunnel: boolean;
+  inFloodedTunnel: boolean;
+  activeTool: TunnelToolId;
+  collapseWarningTimer: number;
+  caveInShakeTimer: number;
   /** Visual outfit & proportion theme */
   outfit: CharacterOutfit;
 }
@@ -328,23 +351,42 @@ export type GameCommand =
   | { type: 'TOGGLE_BARRICADE_WINDOW'; actorId: string; windowId: string }
   | { type: 'USE_ROOF_ACCESS'; actorId: string; houseId: string; direction: 'up' | 'down' }
   | { type: 'USE_SHELTER_ACCESS'; actorId: string; houseId: string; direction: 'enter' | 'exit' }
+  | { type: 'TOGGLE_SHELTER_HATCH'; actorId: string; houseId: string }
+  | { type: 'USE_TUNNEL_SHAFT'; actorId: string; ladderId: string; direction: 'up' | 'down' }
   | { type: 'DISMOUNT_LADDER'; actorId: string }
+  | { type: 'SELECT_TOOL'; actorId: string; tool: TunnelToolId }
+  | { type: 'USE_ACTIVE_TOOL'; actorId: string }
   | { type: 'SET_SLOT_CONTROLLER'; slotId: string; controller: ControllerType }
   | { type: 'ADVANCE_TIME'; hours: number }
-  // Future-phase multiplayer-ready command stubs (not exposed in Phase 1 UI)
   | { type: 'DIG'; actorId: string; gx: number; gy: number; gz: number }
   | { type: 'BUILD'; actorId: string; itemId: string; slotId: string }
   | { type: 'BUY'; actorId: string; itemId: string }
   | { type: 'FIRE'; actorId: string; weaponId: string; target: Vec3 }
+  | { type: 'EQUIP_WEAPON'; actorId: string; weaponId: WeaponId }
   | { type: 'CALL_911'; actorId: string }
-  | { type: 'POST_PHOTO'; actorId: string; captionKey: string };
+  | { type: 'POST_PHOTO'; actorId: string; captionKey: string }
+  | { type: 'CLAIM_MISSION'; actorId: string; missionId: string }
+  | { type: 'TRIGGER_RAID'; actorId: string }
+  | { type: 'CLEAR_FEED_UNREAD'; actorId: string };
 
 export interface InteractionTarget {
-  kind: 'door' | 'window' | 'roof_up' | 'roof_down' | 'shelter_enter' | 'shelter_exit' | 'yard_slot' | 'tunnel_entry';
+  kind:
+    | 'door'
+    | 'window'
+    | 'roof_up'
+    | 'roof_down'
+    | 'shelter_enter'
+    | 'shelter_exit'
+    | 'shaft_up'
+    | 'shaft_down'
+    | 'yard_slot'
+    | 'roof_pad'
+    | 'tunnel_entry';
   id: string;
   houseId: string;
   labelKey: string;
   actionKey: string;
+  actionParams?: Record<string, string | number>;
   secondaryHintKey?: string;
   stateBadgeKey?: string;
   distance: number;
@@ -371,6 +413,7 @@ export interface GameState {
   shelterHatches: Record<string, { isOpen: boolean; openProgress: number }>;
   tunnels: TunnelNetworkState;
   socialFeed: SocialPost[];
+  phase3: Phase3State;
 }
 
 /** Compact JSON save payload */
@@ -397,7 +440,11 @@ export interface SerializedGameState {
       | 'inShelter'
       | 'currentFloor'
       | 'insideHouseId'
-    >
+    > & {
+      oxygen?: number;
+      inTunnel?: boolean;
+      activeTool?: TunnelToolId;
+    }
   >;
   doors: Record<string, Pick<DoorEntity, 'isOpen' | 'isLocked' | 'isBarricaded' | 'damageState'>>;
   windows: Record<string, Pick<WindowEntity, 'isOpen' | 'isBarricaded' | 'damageState'>>;
@@ -405,4 +452,5 @@ export interface SerializedGameState {
   shelterHatches?: Record<string, { isOpen: boolean }>;
   tunnels: TunnelNetworkState;
   socialFeed: SocialPost[];
+  phase3?: SerializedPhase3State;
 }

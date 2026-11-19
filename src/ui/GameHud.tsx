@@ -6,20 +6,101 @@
 
 import { t } from '../i18n/translations';
 import { formatGameClock } from '../simulation/simulation';
-import type { HudSnapshot } from '../rendering/GameCanvas';
+import type { HudDigTargetSnapshot, HudSnapshot } from '../rendering/GameCanvas';
 import type { CameraMode } from '../storage/localSettings';
+import { TOOL_COSTS, TOOL_ORDER } from '../tunnels/tunnelEngine';
+import type { TunnelToolId } from '../tunnels/tunnelTypes';
+import { WEAPON_ORDER, WEAPON_SPECS, type WeaponId } from '../phase3/phase3Types';
 
 interface GameHudProps {
   hud: HudSnapshot;
   cameraMode: CameraMode;
   audioMuted: boolean;
   debugMode: boolean;
+  phoneOpen?: boolean;
+  touchControlsActive?: boolean;
   toastText: string | null;
+  onTogglePhone: () => void;
   onToggleCamera: () => void;
   onQuickSave: () => void;
   onToggleMute: () => void;
   onPause: () => void;
   onAdvanceTime: () => void;
+  onSelectTool: (tool: TunnelToolId) => void;
+  onEquipWeapon: (weapon: WeaponId) => void;
+}
+
+function formatDigPrompt(target: HudDigTargetSnapshot, cash: number): { label: string; blocked: boolean } {
+  if (!target.valid && target.reasonKey) {
+    return { label: t(target.reasonKey), blocked: true };
+  }
+  if (target.cost > 0 && cash < target.cost) {
+    return { label: t('tunnel.err.noCash', { cost: target.cost }), blocked: true };
+  }
+  if (target.actionKind === 'dig') {
+    const soilLabel = t(`soil.${target.soil}`);
+    if (target.gy === 1) {
+      return {
+        label: t('tunnel.action.digSurface', { hits: target.hitsDone, max: target.hitsMax }),
+        blocked: false,
+      };
+    }
+    if (target.gy === -1) {
+      return {
+        label: t('tunnel.action.digDeep', { hits: target.hitsDone, max: target.hitsMax }),
+        blocked: false,
+      };
+    }
+    return {
+      label: t('tunnel.action.dig', {
+        soil: soilLabel,
+        hits: target.hitsDone,
+        max: target.hitsMax,
+      }),
+      blocked: false,
+    };
+  }
+  return {
+    label: t(`tunnel.action.${target.actionKind}`, { cost: target.cost }),
+    blocked: false,
+  };
+}
+
+function ToolIcon({ tool }: { tool: TunnelToolId }) {
+  switch (tool) {
+    case 'shovel':
+      return (
+        <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+          <path d="M14 4l6 6-2 2-6-6 2-2z" />
+          <path d="M13 7L5 15l-2 6 6-2 8-8" />
+        </svg>
+      );
+    case 'timber':
+      return (
+        <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+          <path d="M4 6h16M6 6v14M18 6v14M6 11l4-5M18 11l-4-5" />
+        </svg>
+      );
+    case 'lantern':
+      return (
+        <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+          <path d="M9 4h6M12 4v3M8 7h8v10H8zM9 20h6" />
+        </svg>
+      );
+    case 'vent':
+      return (
+        <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+          <rect x="3" y="6" width="18" height="12" />
+          <path d="M7 10h10M7 14h10" />
+        </svg>
+      );
+    case 'pump':
+      return (
+        <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+          <path d="M12 3c-3 4.5-6 7.8-6 11a6 6 0 1 0 12 0c0-3.2-3-6.5-6-11z" />
+        </svg>
+      );
+  }
 }
 
 export function GameHud({
@@ -27,15 +108,35 @@ export function GameHud({
   cameraMode,
   audioMuted,
   debugMode,
+  phoneOpen = false,
+  touchControlsActive = false,
   toastText,
+  onTogglePhone,
   onToggleCamera,
   onQuickSave,
   onToggleMute,
   onPause,
   onAdvanceTime,
+  onSelectTool,
+  onEquipWeapon,
 }: GameHudProps) {
   const clockStr = formatGameClock(hud.timeOfDay);
   const hpPct = Math.max(0, Math.min(100, (hud.health / Math.max(1, hud.maxHealth)) * 100));
+  const stamPct = Math.max(0, Math.min(100, hud.stamina));
+  const oxyPct = Math.max(0, Math.min(100, (hud.oxygen / Math.max(1, hud.maxOxygen)) * 100));
+  const showOxygen = hud.inTunnel || hud.oxygen < 99;
+  const showHotbar = hud.inShelter || hud.inTunnel;
+  const showWeaponBar = !showHotbar && !hud.isClimbing;
+
+  const alertKey = hud.collapseWarning
+    ? 'hud.caveInWarning'
+    : hud.inTunnel && hud.oxygen < 42
+      ? 'hud.lowAir'
+      : hud.inFloodedTunnel
+        ? 'hud.flooded'
+        : null;
+
+  const digPrompt = hud.digTarget ? formatDigPrompt(hud.digTarget, hud.money) : null;
 
   const blurClick = (fn: () => void) => (e: React.MouseEvent<HTMLButtonElement>) => {
     e.currentTarget.blur();
@@ -54,7 +155,6 @@ export function GameHud({
           {/* Row 1: Day, Clock & Location */}
           <div className="flex items-center justify-between gap-2 border-b border-[#3a3e42] pb-1.5">
             <div className="flex items-center gap-1.5 sm:gap-2 min-w-0">
-              {/* Custom Sun / Moon SVG Icon */}
               {hud.isNight ? (
                 <svg viewBox="0 0 24 24" className="w-4 h-4 text-[#a9c2e8] shrink-0" aria-hidden="true">
                   <path
@@ -95,22 +195,49 @@ export function GameHud({
             </button>
           </div>
 
-          {/* Row 2: Health Bar & Cash */}
+          {/* Row 2: Health Bar, Stamina Strip & Cash */}
           <div className="mt-1.5 sm:mt-2 flex items-center justify-between gap-2.5 sm:gap-4">
-            {/* HP Bar */}
-            <div className="flex-1 min-w-[78px] sm:min-w-[110px]">
-              <div className="flex items-center justify-between text-[10px] sm:text-[11px] font-mono-hud mb-1">
-                <span className="text-[#b8b0a1] font-semibold">{t('hud.health')}</span>
-                <span className="text-[#f2ece1] font-bold" data-testid="hud-health">
-                  {hud.health}
-                </span>
+            <div className="flex-1 min-w-[78px] sm:min-w-[115px] space-y-1">
+              <div>
+                <div className="flex items-center justify-between text-[10px] sm:text-[11px] font-mono-hud mb-0.5">
+                  <span className="text-[#b8b0a1] font-semibold">{t('hud.health')}</span>
+                  <span className="text-[#f2ece1] font-bold" data-testid="hud-health">
+                    {hud.health}
+                  </span>
+                </div>
+                <div className="h-2 sm:h-2.5 w-full bg-[#101316] border border-[#424549] p-[1px]">
+                  <div
+                    className="h-full bg-[#a84234] transition-all duration-150"
+                    style={{ width: `${hpPct}%` }}
+                  />
+                </div>
               </div>
-              <div className="h-2 sm:h-2.5 w-full bg-[#101316] border border-[#424549] p-[1px]">
+              {/* Compact Stamina Strip */}
+              <div className="h-1.5 w-full bg-[#101316] border border-[#3a3d40] p-[0.5px]">
                 <div
-                  className="h-full bg-[#a84234] transition-all duration-150"
-                  style={{ width: `${hpPct}%` }}
+                  className="h-full bg-[#c99b43] transition-all duration-100"
+                  style={{ width: `${stamPct}%` }}
                 />
               </div>
+              {/* Underground Oxygen Bar (only shown inside tunnels or while recovering) */}
+              {showOxygen && (
+                <div data-testid="hud-oxygen-wrap">
+                  <div className="flex items-center justify-between text-[9px] sm:text-[10px] font-mono-hud mb-0.5">
+                    <span className={oxyPct < 40 ? 'text-[#f27c6e] font-bold' : 'text-[#8ec3d6] font-semibold'}>
+                      {t('hud.oxygen')}
+                    </span>
+                    <span className="text-[#e6f3f7] font-bold" data-testid="hud-oxygen">
+                      {hud.oxygen}%
+                    </span>
+                  </div>
+                  <div className="h-1.5 w-full bg-[#101316] border border-[#3d4d54] p-[0.5px]">
+                    <div
+                      className={`h-full transition-all duration-150 ${oxyPct < 40 ? 'bg-[#d45646]' : 'bg-[#56a8c7]'}`}
+                      style={{ width: `${oxyPct}%` }}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Money Counter */}
@@ -154,7 +281,7 @@ export function GameHud({
               <div>
                 POS {hud.playerX.toFixed(2)}, {hud.playerY.toFixed(2)}, {hud.playerZ.toFixed(2)} · F{hud.floorLevel} ·{' '}
                 {hud.debugInfo.animState.toUpperCase()}
-                {hud.debugInfo.onStairs ? ' (STAIRS)' : ''}
+                {hud.debugInfo.onStairs ? ' (STAIRS)' : ''} · TUN {hud.tunnelCount}
               </div>
               <div>
                 CAM {hud.debugInfo.camDist.toFixed(2)}m / {hud.debugInfo.camDesired.toFixed(2)}m [
@@ -168,7 +295,27 @@ export function GameHud({
 
         {/* Top-Right Compact Utility Icon Buttons */}
         <div className="pointer-events-auto flex items-center gap-1 sm:gap-1.5 shrink-0">
-          {/* Camera Mode Toggle [C] */}
+          <button
+            type="button"
+            tabIndex={-1}
+            onClick={blurClick(onTogglePhone)}
+            aria-label={t('aria.openPhone')}
+            title={`${t('aria.openPhone')} [P]`}
+            data-testid="hud-phone-btn"
+            className="relative w-9 h-9 sm:w-auto sm:h-10 sm:px-2.5 bg-[#1b2025e6] hover:bg-[#2a3139f5] border-2 border-[#c67134] shadow-[0_2px_0_rgba(0,0,0,0.5)] text-[#f2eadc] flex items-center justify-center gap-1.5 cursor-pointer"
+          >
+            <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+              <rect x="6" y="2" width="12" height="20" rx="2" />
+              <line x1="12" y1="18" x2="12.01" y2="18" />
+            </svg>
+            <span className="hidden sm:inline font-mono-hud text-xs font-bold">P</span>
+            {hud.phoneBadgeCount > 0 && (
+              <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 bg-[#cf4436] text-[#fff4f0] font-mono-hud text-[10px] font-bold flex items-center justify-center">
+                {hud.phoneBadgeCount}
+              </span>
+            )}
+          </button>
+
           <button
             type="button"
             tabIndex={-1}
@@ -186,7 +333,6 @@ export function GameHud({
             </span>
           </button>
 
-          {/* Quick Save */}
           <button
             type="button"
             tabIndex={-1}
@@ -202,7 +348,6 @@ export function GameHud({
             </svg>
           </button>
 
-          {/* Mute Toggle [M] */}
           <button
             type="button"
             tabIndex={-1}
@@ -225,7 +370,6 @@ export function GameHud({
             )}
           </button>
 
-          {/* Pause [Esc] */}
           <button
             type="button"
             tabIndex={-1}
@@ -241,6 +385,20 @@ export function GameHud({
           </button>
         </div>
       </div>
+
+      {/* UNDERGROUND HAZARD OR PHASE 3 RAID / 911 POLICE BANNER */}
+      {!phoneOpen && (alertKey || hud.raidBannerKey) && (
+        <div
+          className={`fixed top-28 sm:top-4 left-1/2 -translate-x-1/2 max-w-[92vw] text-center border-2 px-3 sm:px-3.5 py-1.5 font-mono-hud text-[10px] sm:text-xs font-bold uppercase tracking-wider shadow-[0_3px_0_rgba(0,0,0,0.65)] ${
+            hud.policeStatus === 'en_route' || hud.policeStatus === 'on_scene'
+              ? 'bg-[#172438f2] border-[#4b8be8] text-[#e6f0ff]'
+              : 'bg-[#2b1a18f2] border-[#d45d4a] text-[#ffe5de]'
+          }`}
+          data-testid={alertKey ? 'hud-tunnel-alert' : 'hud-raid-banner'}
+        >
+          {t(alertKey ?? hud.raidBannerKey!)}
+        </div>
+      )}
 
       {/* CENTER FIRST-PERSON CROSSHAIR */}
       {cameraMode === 'first' && (
@@ -258,8 +416,12 @@ export function GameHud({
         </div>
       )}
 
-      {/* BOTTOM INTERACTION OR CLIMBING PROMPT */}
-      <div className="flex flex-col items-center gap-2 pb-1">
+      {/* BOTTOM PROMPTS & UNDERGROUND EQUIPMENT BAR */}
+      <div
+        className={`flex flex-col items-center gap-1.5 sm:gap-2 ${
+          touchControlsActive ? 'pb-[168px] sm:pb-1' : 'pb-1'
+        }`}
+      >
         {hud.isClimbing ? (
           <div
             className="bg-[#1b2025ed] border-2 border-[#c7b593] shadow-[0_3px_0_rgba(0,0,0,0.65)] px-4 py-2 font-mono-hud text-xs font-bold uppercase tracking-wider text-[#f4efe4]"
@@ -268,31 +430,143 @@ export function GameHud({
             {t('hud.climbingHint')}
           </div>
         ) : (
-          hud.interaction && (
-            <div
-              className="bg-[#1b2025ed] border-2 border-[#c7b593] shadow-[0_3px_0_rgba(0,0,0,0.65)] px-4 py-2 flex flex-col items-center gap-0.5"
-              data-testid="hud-interact-prompt"
-            >
-              <div className="flex items-center gap-2">
-                <span className="px-1.5 py-0.5 bg-[#c67134] text-[#15171a] font-mono-hud font-bold text-xs">
-                  E
-                </span>
-                <span className="font-display font-bold text-base tracking-wide uppercase text-[#f4efe4]">
-                  {t(hud.interaction.actionKey, { name: t(hud.interaction.labelKey) })}
-                </span>
-                {hud.interaction.stateBadgeKey && (
-                  <span className="px-1.5 py-0.5 bg-[#6b342b] text-[#f2ddd9] font-mono-hud text-[10px] uppercase">
-                    {t(hud.interaction.stateBadgeKey)}
+          <>
+            {hud.interaction && (
+              <div
+                className="bg-[#1b2025ed] border-2 border-[#c7b593] shadow-[0_3px_0_rgba(0,0,0,0.65)] px-4 py-1.5 flex flex-col items-center gap-0.5"
+                data-testid="hud-interact-prompt"
+              >
+                <div className="flex items-center gap-2">
+                  <span className="px-1.5 py-0.5 bg-[#c67134] text-[#15171a] font-mono-hud font-bold text-xs">
+                    E
+                  </span>
+                  <span className="font-display font-bold text-sm sm:text-base tracking-wide uppercase text-[#f4efe4]">
+                    {t(hud.interaction.actionKey, {
+                      name: t(hud.interaction.labelKey),
+                      ...(hud.interaction.actionParams ?? {}),
+                    })}
+                  </span>
+                  {hud.interaction.stateBadgeKey && (
+                    <span className="px-1.5 py-0.5 bg-[#6b342b] text-[#f2ddd9] font-mono-hud text-[10px] uppercase">
+                      {t(hud.interaction.stateBadgeKey)}
+                    </span>
+                  )}
+                </div>
+                {hud.interaction.secondaryHintKey && (
+                  <span className="font-mono-hud text-[10px] sm:text-[11px] text-[#c7baa2]">
+                    {t(hud.interaction.secondaryHintKey)}
                   </span>
                 )}
               </div>
-              {hud.interaction.secondaryHintKey && (
-                <span className="font-mono-hud text-[11px] text-[#c7baa2]">
-                  {t(hud.interaction.secondaryHintKey)}
+            )}
+
+            {digPrompt && (
+              <div
+                className={`bg-[#1b2025ed] border-2 shadow-[0_3px_0_rgba(0,0,0,0.65)] px-3.5 py-1.5 flex items-center gap-2 ${
+                  digPrompt.blocked ? 'border-[#a6483e]' : 'border-[#d6a34a]'
+                }`}
+                data-testid="hud-dig-prompt"
+              >
+                <span className="px-1.5 py-0.5 bg-[#d6a34a] text-[#15171a] font-mono-hud font-bold text-[11px]">
+                  F / LMB
                 </span>
-              )}
-            </div>
-          )
+                <span
+                  className={`font-display font-bold text-sm sm:text-base tracking-wide uppercase ${
+                    digPrompt.blocked ? 'text-[#f0b4ad]' : 'text-[#f4efe4]'
+                  }`}
+                >
+                  {digPrompt.label}
+                </span>
+              </div>
+            )}
+          </>
+        )}
+
+        {/* Compact 5-Slot Underground Tunnel Equipment Hotbar (visible in shelter or tunnel) */}
+        {showHotbar && (
+          <div
+            className="pointer-events-auto flex items-center gap-1 bg-[#181c20eb] border-2 border-[#4d4a44] shadow-[0_3px_0_rgba(0,0,0,0.6)] p-1"
+            data-testid="hud-tool-bar"
+          >
+            {TOOL_ORDER.map((tool, idx) => {
+              const active = hud.activeTool === tool;
+              const cost = TOOL_COSTS[tool];
+              return (
+                <button
+                  key={tool}
+                  type="button"
+                  tabIndex={-1}
+                  aria-label={t(`tool.${tool}`)}
+                  onClick={blurClick(() => onSelectTool(tool))}
+                  className={`relative px-2 sm:px-2.5 py-1.5 flex items-center gap-1.5 border cursor-pointer transition-colors ${
+                    active
+                      ? 'bg-[#c67134] text-[#141618] border-[#f4e2c6]'
+                      : 'bg-[#252b31] hover:bg-[#313942] text-[#dfd7c8] border-[#484b4f]'
+                  }`}
+                >
+                  <span className="font-mono-hud text-[10px] font-bold opacity-80">{idx + 1}</span>
+                  <ToolIcon tool={tool} />
+                  <span className="hidden sm:inline font-display font-bold text-xs uppercase tracking-wide">
+                    {t(`tool.${tool}`)}
+                  </span>
+                  {cost > 0 && (
+                    <span
+                      className={`font-mono-hud text-[10px] font-bold ${
+                        active ? 'text-[#1c1a17]' : 'text-[#b7c88d]'
+                      }`}
+                    >
+                      ${cost}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
+        {/* Compact Above-Ground Phase 3 Weapon Bar (hidden underground where Tunnel Tool Bar appears) */}
+        {showWeaponBar && (
+          <div
+            className="pointer-events-auto flex items-center gap-1 bg-[#181c20eb] border-2 border-[#4d4a44] shadow-[0_3px_0_rgba(0,0,0,0.6)] p-1"
+            data-testid="hud-weapon-bar"
+          >
+            {WEAPON_ORDER.filter((w) => hud.ownedWeapons.includes(w)).map((weapon) => {
+              const slotNum = WEAPON_ORDER.indexOf(weapon) + 1;
+              const active = hud.activeWeapon === weapon;
+              const spec = WEAPON_SPECS[weapon];
+              const ammoCount = spec.infiniteAmmo ? '∞' : String(hud.weaponAmmo[weapon] ?? 0);
+              return (
+                <button
+                  key={weapon}
+                  type="button"
+                  tabIndex={-1}
+                  aria-label={t(spec.nameKey)}
+                  onClick={blurClick(() => onEquipWeapon(weapon))}
+                  className={`px-2 sm:px-2.5 py-1.5 flex items-center gap-1.5 border cursor-pointer transition-colors ${
+                    active
+                      ? 'bg-[#c67134] text-[#141618] border-[#f4e2c6]'
+                      : 'bg-[#252b31] hover:bg-[#313942] text-[#dfd7c8] border-[#484b4f]'
+                  }`}
+                >
+                  <span className="font-mono-hud text-[10px] font-bold opacity-80">{slotNum}</span>
+                  <span
+                    className="w-2.5 h-2.5 shrink-0 border border-black/40"
+                    style={{ backgroundColor: spec.color }}
+                    aria-hidden="true"
+                  />
+                  <span className="hidden sm:inline font-display font-bold text-xs uppercase tracking-wide">
+                    {t(spec.nameKey)}
+                  </span>
+                  <span
+                    className={`font-mono-hud text-[10px] font-bold ${
+                      active ? 'text-[#1c1a17]' : 'text-[#b7c88d]'
+                    }`}
+                  >
+                    {ammoCount}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
         )}
       </div>
     </div>

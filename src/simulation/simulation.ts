@@ -2,8 +2,8 @@
  * Core Neighborhood Wars simulation engine.
  * Pure TypeScript, zero React or Three.js imports, fixed-timestep (60 Hz),
  * deterministic seeded RNG, SpatialHashGrid collision acceleration,
- * analytic stair ramps, real ladder/shelter hatch climbing, startup walkability verification,
- * multiplayer-ready command queue & JSON serialization.
+ * analytic stair ramps, real ladder/shelter/tunnel shaft climbing, startup walkability verification,
+ * Phase 2 underground tunnel digging & survival network, multiplayer-ready command queue & JSON save/load.
  */
 
 import { SeededRNG } from './rng';
@@ -21,21 +21,102 @@ import type {
   NavNode,
   SerializedGameState,
   StairRamp,
+  Vec3,
 } from './types';
 import { generateStreetLayout, STREET_CONFIG } from '../world/streetLayout';
 import { buildHouseBlueprint, HOUSE_CONSTANTS, localToWorld, worldToLocal } from '../world/houses';
 import type { HouseBlueprint } from '../world/houses';
 import { generateStreetProps, type StreetPropsBundle } from '../world/streetProps';
-import { createEmptyTunnelNetwork } from '../tunnels/tunnelTypes';
+import {
+  createEmptyTunnelNetwork,
+  type SoilLayerType,
+  type TunnelSegment,
+} from '../tunnels/tunnelTypes';
+import {
+  buildSegmentMap,
+  buildShelterPortals,
+  buildTunnelCollisionData,
+  canDigCellFrom,
+  computeVentilationNetwork,
+  drainFloodedPocket,
+  evaluateTunnelStability,
+  findTunnelActionTarget,
+  floodWaterFromCell,
+  gridToWorldCenter,
+  parseTunnelCellKey,
+  sampleSoilLayer,
+  SOIL_STATS,
+  TOOL_COSTS,
+  TUNNEL_CONSTANTS,
+  tunnelCellKey,
+  worldToGrid,
+  type ShelterTunnelPortal,
+  type TunnelActionTarget,
+  type TunnelAirInfo,
+  type TunnelStabilityInfo,
+} from '../tunnels/tunnelEngine';
 import { createIdleNeighborBrain, updateIdleNeighborAI } from '../ai/neighborAI';
 import type { IdleNeighborBrain } from '../ai/neighborAI';
+import {
+  createInitialPhase3State,
+  createWelcomeSocialFeed,
+  handleBuildDefense,
+  handleBuyShopItem,
+  handleCall911,
+  handleClaimMission,
+  handleEquipWeapon,
+  handleFireWeapon,
+  handlePostPhoto,
+  hydratePhase3State,
+  serializePhase3State,
+  spawnNightRaid,
+  stepPhase3,
+  type Phase3ActionResult,
+} from '../phase3/phase3Engine';
+import { DEFENSE_SPECS, YARD_SLOT_TO_DEFENSE, type WeaponId } from '../phase3/phase3Types';
 
-export const SAVE_VERSION = 2;
+export const SAVE_VERSION = 4;
 export const FIXED_DT = 1 / 60;
 
 export interface SimSoundEvent {
-  type: 'footstep' | 'jump' | 'land' | 'door' | 'lock' | 'barricade' | 'climb';
+  type:
+    | 'footstep'
+    | 'jump'
+    | 'land'
+    | 'door'
+    | 'lock'
+    | 'barricade'
+    | 'climb'
+    | 'dig_hit'
+    | 'dig_complete'
+    | 'timber'
+    | 'lantern'
+    | 'vent'
+    | 'pump'
+    | 'cave_in'
+    | 'water_seep'
+    | 'shot'
+    | 'hit'
+    | 'trap'
+    | 'explosion'
+    | 'bark'
+    | 'siren'
+    | 'cash'
+    | 'phone'
+    | 'alert';
   surface?: ActorEntity['currentSurface'];
+  soil?: SoilLayerType;
+}
+
+export interface SimToastEvent {
+  key: string;
+  params?: Record<string, string | number>;
+}
+
+export interface SimParticleEvent {
+  pos: Vec3;
+  kind: 'dirt' | 'clay' | 'rock' | 'water' | 'dust';
+  count: number;
 }
 
 export class GameSimulation {
@@ -46,19 +127,33 @@ export class GameSimulation {
   public readonly colliders: AABB[] = [];
   public readonly spatialGrid: SpatialHashGrid;
   public readonly stairRamps: StairRamp[] = [];
-  public readonly laddersById: Record<string, LadderSpec> = {};
+  public readonly baseLaddersById: Record<string, LadderSpec> = {};
+  public laddersById: Record<string, LadderSpec> = {};
   public readonly streetProps: StreetPropsBundle;
   public readonly navNodes: NavNode[] = [];
   public readonly roadLength: number;
   public readonly walkabilityReport: WalkabilityReport;
+  public readonly shelterPortals: ShelterTunnelPortal[] = [];
+
+  public tunnelSegmentMap = new Map<string, TunnelSegment>();
+  public tunnelStability: TunnelStabilityInfo = {
+    unsupportedHopsByKey: new Map(),
+    unstableKeys: new Set(),
+    collapseCandidateKey: null,
+  };
+  public tunnelAir: TunnelAirInfo = { freshAirKeys: new Set() };
+  public tunnelVersion = 0;
 
   private accumulator = 0;
   private latestInputs: Record<string, MoveInputPayload> = {};
   private aiBrains: Record<string, IdleNeighborBrain> = {};
   private pendingSounds: SimSoundEvent[] = [];
+  private pendingParticles: SimParticleEvent[] = [];
+  private pendingToasts: SimToastEvent[] = [];
   private stepMeters: Record<string, number> = {};
+  private koRecoverTimers: Record<string, number> = {};
 
-  constructor(seed: number = 202611, lotCount: number = 6) {
+  constructor(seed: number = 202611, lotCount: number = 8) {
     this.rng = new SeededRNG(seed);
     this.spatialGrid = new SpatialHashGrid(4.0);
     const street = generateStreetLayout(seed, lotCount);
@@ -111,7 +206,10 @@ export class GameSimulation {
       for (const s of bp.yardSlots) yardSlots[s.id] = s;
       for (const c of bp.colliders) this.colliders.push(c);
       for (const sr of bp.stairRamps) this.stairRamps.push(sr);
-      for (const l of bp.ladders) this.laddersById[l.id] = l;
+      for (const l of bp.ladders) {
+        this.baseLaddersById[l.id] = l;
+        this.laddersById[l.id] = l;
+      }
       for (const n of bp.navNodes) this.navNodes.push(n);
 
       // Spawn local human player cleanly on their front walkway facing Maple Crescent & Gary
@@ -149,16 +247,24 @@ export class GameSimulation {
           maxHealth: 100,
           stamina: 100,
           maxStamina: 100,
+          oxygen: 100,
+          maxOxygen: 100,
           money: 250,
           animState: 'idle',
           animTime: 0,
           interactTimer: 0,
+          digTimer: 0,
           walkDistance: 0,
           currentSurface: 'concrete',
           climbState: null,
           insideHouseId: null,
           currentFloor: 0,
           inShelter: false,
+          inTunnel: false,
+          inFloodedTunnel: false,
+          activeTool: 'shovel',
+          collapseWarningTimer: 0,
+          caveInShakeTimer: 0,
           outfit: {
             jacket: '#4c5e4b',
             shirt: '#d7cfc0',
@@ -177,7 +283,7 @@ export class GameSimulation {
         };
       }
 
-      // Spawn Phase 1 Idle AI neighbor across the street (reuses exact same rig with distinct outfit/proportions)
+      // Spawn Phase 1 Idle AI neighbor across the street
       if (lot.ownerSlotId === 'slot_neighbor_1') {
         const brain = createIdleNeighborBrain('actor_neighbor_1', bp);
         this.aiBrains['actor_neighbor_1'] = brain;
@@ -206,16 +312,24 @@ export class GameSimulation {
           maxHealth: 100,
           stamina: 100,
           maxStamina: 100,
+          oxygen: 100,
+          maxOxygen: 100,
           money: 300,
           animState: 'idle',
           animTime: 0,
           interactTimer: 0,
+          digTimer: 0,
           walkDistance: 0,
           currentSurface: 'grass',
           climbState: null,
           insideHouseId: null,
           currentFloor: 0,
           inShelter: false,
+          inTunnel: false,
+          inFloodedTunnel: false,
+          activeTool: 'shovel',
+          collapseWarningTimer: 0,
+          caveInShakeTimer: 0,
           outfit: {
             jacket: '#7c553c',
             shirt: '#c7c1b4',
@@ -235,16 +349,19 @@ export class GameSimulation {
       }
     }
 
+    // Extract shelter bulkhead portals across all houses
+    this.shelterPortals = buildShelterPortals(this.houses);
+
     // Generate all deterministic street & yard props + register their exact colliders
     this.streetProps = generateStreetProps(this.houses, this.roadLength, seed);
     for (const c of this.streetProps.colliders) {
       this.colliders.push(c);
     }
 
-    // Index all colliders in SpatialHashGrid for O(1) physics & raycast lookups
+    // Index all static colliders in SpatialHashGrid for O(1) physics & raycast lookups
     this.spatialGrid.insertMany(this.colliders);
 
-    // Run automatic startup walkability check across all lots, rooms, stairs, roof doors & shelters
+    // Run automatic startup walkability check before adding un-dug soil plugs (doors are openable later)
     this.walkabilityReport = runWalkabilityCheck(this.houses, this.spatialGrid);
 
     this.state = {
@@ -263,8 +380,11 @@ export class GameSimulation {
       yardSlots,
       shelterHatches,
       tunnels: createEmptyTunnelNetwork(),
-      socialFeed: [],
+      socialFeed: createWelcomeSocialFeed(),
+      phase3: createInitialPhase3State(this.houses),
     };
+
+    this.rebuildTunnelWorldState();
   }
 
   public getLocalPlayer(): ActorEntity {
@@ -278,13 +398,75 @@ export class GameSimulation {
     return out;
   }
 
+  public drainParticleEvents(): SimParticleEvent[] {
+    if (this.pendingParticles.length === 0) return [];
+    const out = this.pendingParticles;
+    this.pendingParticles = [];
+    return out;
+  }
+
+  public drainToastEvents(): SimToastEvent[] {
+    if (this.pendingToasts.length === 0) return [];
+    const out = this.pendingToasts;
+    this.pendingToasts = [];
+    return out;
+  }
+
+  private ingestPhase3Result(res: Phase3ActionResult): void {
+    for (const s of res.sounds) {
+      this.pendingSounds.push({ type: s.type });
+    }
+    if (res.toastKey) {
+      this.pendingToasts.push({ key: res.toastKey, params: res.toastParams });
+    }
+  }
+
+  /** Rebuilds tunnel spatial colliders, ladders, stability spans, and airflow after any tunnel edit. */
+  public rebuildTunnelWorldState(): void {
+    const segments = this.state.tunnels.segments;
+    this.tunnelSegmentMap = buildSegmentMap(segments);
+    this.tunnelStability = evaluateTunnelStability(segments, this.shelterPortals);
+    this.tunnelAir = computeVentilationNetwork(segments, this.shelterPortals);
+
+    const { colliders, ladders } = buildTunnelCollisionData(
+      this.state.tunnels,
+      this.shelterPortals,
+    );
+    this.spatialGrid.replaceByPrefix('tunnel_', colliders);
+
+    const mergedLadders: Record<string, LadderSpec> = { ...this.baseLaddersById };
+    for (const l of ladders) {
+      mergedLadders[l.id] = l;
+    }
+    this.laddersById = mergedLadders;
+    this.tunnelVersion += 1;
+  }
+
+  public getActiveTunnelTarget(actor: ActorEntity): TunnelActionTarget | null {
+    if (actor.climbState) return null;
+    return findTunnelActionTarget(
+      actor.position,
+      actor.yaw,
+      actor.pitch,
+      actor.inShelter,
+      actor.activeTool,
+      this.state.tunnels,
+      this.shelterPortals,
+      this.state.doors,
+      this.houses,
+      this.colliders,
+      this.state.seed,
+    );
+  }
+
   /** Starts a real, smooth ladder mount -> climb -> dismount sequence (zero teleporting!). */
   private mountLadder(actor: ActorEntity, ladder: LadderSpec, direction: 'up' | 'down'): void {
-    const startPhase = ladder.kind === 'shelter' ? 'opening_hatch' : 'mount';
+    const hatch = ladder.kind === 'shelter' ? this.state.shelterHatches[ladder.houseId] : null;
+    const alreadyOpen = Boolean(hatch && hatch.isOpen && hatch.openProgress > 0.7);
+    const startPhase = ladder.kind === 'shelter' && !alreadyOpen ? 'opening_hatch' : 'mount';
     const mountY = direction === 'up' ? ladder.bottomY + 0.15 : ladder.topY - 0.55;
-    if (ladder.kind === 'shelter') {
-      const hatch = this.state.shelterHatches[ladder.houseId];
-      if (hatch) hatch.isOpen = true;
+    if (hatch) {
+      hatch.isOpen = true;
     }
     actor.climbState = {
       ladderId: ladder.id,
@@ -300,6 +482,184 @@ export class GameSimulation {
     };
     actor.velocity = { x: 0, y: 0, z: 0 };
     this.pendingSounds.push({ type: 'climb' });
+  }
+
+  /** Executes a dig hit on grid coordinates `(gx, gy, gz)`. */
+  private performDigCell(actor: ActorEntity, gx: number, gy: number, gz: number): void {
+    const check = canDigCellFrom(
+      gx,
+      gy,
+      gz,
+      this.tunnelSegmentMap,
+      this.shelterPortals,
+      this.state.doors,
+      this.houses,
+      this.colliders,
+    );
+    if (!check.ok) {
+      actor.digTimer = 0.16;
+      this.pendingSounds.push({ type: 'lock' });
+      return;
+    }
+
+    const soil = sampleSoilLayer(this.state.seed, gx, gy, gz);
+    const stats = SOIL_STATS[soil];
+    if (actor.stamina < Math.min(4, stats.staminaPerHit)) {
+      this.pendingSounds.push({ type: 'lock' });
+      return;
+    }
+
+    actor.stamina = Math.max(0, actor.stamina - stats.staminaPerHit);
+    actor.digTimer = 0.28;
+
+    const key = tunnelCellKey(gx, gy, gz);
+    if (!this.state.tunnels.digProgress) this.state.tunnels.digProgress = {};
+    const prev = this.state.tunnels.digProgress[key] ?? {
+      hits: 0,
+      maxHits: stats.hits,
+      soil,
+    };
+    prev.hits += 1;
+
+    const hitPos = gridToWorldCenter(gx, Math.min(0, gy), gz);
+    hitPos.y += gy === 1 ? 2.5 : gy === -1 ? 0.2 : 1.3;
+    const pKind: SimParticleEvent['kind'] =
+      soil === 'rock' ? 'rock' : soil === 'clay' ? 'clay' : soil === 'water' ? 'water' : 'dirt';
+
+    if (prev.hits < prev.maxHits) {
+      this.state.tunnels.digProgress[key] = prev;
+      this.pendingSounds.push({ type: 'dig_hit', soil });
+      this.pendingParticles.push({ pos: hitPos, kind: pKind, count: 10 });
+      return;
+    }
+
+    // Excavation breakthrough!
+    delete this.state.tunnels.digProgress[key];
+    const newSeg: TunnelSegment = {
+      id: `tunnel_${gx}_${gy}_${gz}`,
+      ownerId: actor.ownerId,
+      gx,
+      gy,
+      gz,
+      soil,
+      supported: gy === 1, // surface shafts have timber collar framing
+      ventilated: gy === 1,
+      lit: false,
+      flooded: false,
+      isSurfaceExit: gy === 1,
+    };
+    this.state.tunnels.segments.push(newSeg);
+    actor.money += stats.salvageCash;
+
+    this.tunnelSegmentMap.set(key, newSeg);
+    if (soil === 'water') {
+      floodWaterFromCell(newSeg, this.tunnelSegmentMap);
+      this.pendingSounds.push({ type: 'water_seep', soil });
+      this.pendingParticles.push({ pos: hitPos, kind: 'water', count: 22 });
+    } else {
+      this.pendingSounds.push({ type: 'dig_complete', soil });
+      this.pendingParticles.push({ pos: hitPos, kind: pKind, count: 22 });
+    }
+
+    this.rebuildTunnelWorldState();
+  }
+
+  /** Applies any tool action (`shovel`, `timber`, `lantern`, `vent`, `pump`) at the aimed target. */
+  private performActiveTool(actor: ActorEntity): void {
+    const target = this.getActiveTunnelTarget(actor);
+    if (!target) return;
+
+    if (target.actionKind === 'dig') {
+      this.performDigCell(actor, target.gx, target.gy, target.gz);
+      return;
+    }
+
+    const seg = this.tunnelSegmentMap.get(tunnelCellKey(target.gx, target.gy, target.gz));
+    if (!seg || !target.valid) {
+      this.pendingSounds.push({ type: 'lock' });
+      return;
+    }
+
+    const cost = TOOL_COSTS[actor.activeTool];
+    if (actor.money < cost) {
+      this.pendingSounds.push({ type: 'lock' });
+      return;
+    }
+
+    actor.money -= cost;
+    actor.interactTimer = 0.28;
+
+    if (actor.activeTool === 'timber') {
+      seg.supported = true;
+      this.pendingSounds.push({ type: 'timber' });
+      this.pendingParticles.push({ pos: { ...target.worldCenter, y: target.worldCenter.y + 1.4 }, kind: 'dust', count: 8 });
+      this.rebuildTunnelWorldState();
+    } else if (actor.activeTool === 'lantern') {
+      seg.lit = true;
+      this.pendingSounds.push({ type: 'lantern' });
+      this.tunnelVersion += 1;
+    } else if (actor.activeTool === 'vent') {
+      seg.ventilated = true;
+      this.pendingSounds.push({ type: 'vent' });
+      this.rebuildTunnelWorldState();
+    } else if (actor.activeTool === 'pump') {
+      drainFloodedPocket(seg, this.tunnelSegmentMap);
+      this.pendingSounds.push({ type: 'pump' });
+      this.pendingParticles.push({ pos: { ...target.worldCenter, y: target.worldCenter.y + 0.3 }, kind: 'water', count: 16 });
+      this.rebuildTunnelWorldState();
+    }
+  }
+
+  private triggerCaveIn(actor: ActorEntity): void {
+    const collapseKey = this.tunnelStability.collapseCandidateKey;
+    if (!collapseKey) return;
+    const idx = this.state.tunnels.segments.findIndex(
+      (s) => tunnelCellKey(s.gx, s.gy, s.gz) === collapseKey,
+    );
+    if (idx === -1) return;
+
+    const collapsed = this.state.tunnels.segments[idx];
+    const collapsedCenter = gridToWorldCenter(collapsed.gx, collapsed.gy, collapsed.gz);
+    this.state.tunnels.segments.splice(idx, 1);
+
+    // If the actor was standing inside the collapsed cell, shift them smoothly to the nearest safe cell/shelter
+    const actorGrid = worldToGrid(actor.position.x, actor.position.y, actor.position.z);
+    if (
+      actorGrid.gx === collapsed.gx &&
+      actorGrid.gy === collapsed.gy &&
+      actorGrid.gz === collapsed.gz
+    ) {
+      let bestPos: Vec3 | null = null;
+      let bestDist = Infinity;
+      for (const s of this.state.tunnels.segments) {
+        const sc = gridToWorldCenter(s.gx, s.gy, s.gz);
+        const d = Math.hypot(sc.x - actor.position.x, sc.z - actor.position.z);
+        if (d < bestDist) {
+          bestDist = d;
+          bestPos = sc;
+        }
+      }
+      if (!bestPos) {
+        const home = this.houseById[actor.houseId];
+        const shFloor = home?.anchors.find((a) => a.kind === 'shelterFloor');
+        bestPos = shFloor ? { ...shFloor.position } : { x: -11.2, y: HOUSE_CONSTANTS.SHELTER_Y, z: 36.2 };
+      }
+      actor.position = { ...bestPos };
+      actor.velocity = { x: 0, y: 0, z: 0 };
+    }
+
+    actor.health = Math.max(0, actor.health - TUNNEL_CONSTANTS.CAVE_IN_DAMAGE);
+    actor.hurtTimer = 0.55;
+    actor.caveInShakeTimer = 0.65;
+    actor.collapseWarningTimer = 0;
+
+    this.pendingSounds.push({ type: 'cave_in' });
+    this.pendingParticles.push({
+      pos: { x: collapsedCenter.x, y: collapsedCenter.y + 1.8, z: collapsedCenter.z },
+      kind: 'dust',
+      count: 28,
+    });
+    this.rebuildTunnelWorldState();
   }
 
   /**
@@ -391,6 +751,24 @@ export class GameSimulation {
         break;
       }
 
+      case 'TOGGLE_SHELTER_HATCH': {
+        const actor = this.state.actors[cmd.actorId];
+        const hatch = this.state.shelterHatches[cmd.houseId];
+        if (!actor || !hatch || actor.climbState) return;
+        actor.interactTimer = 0.28;
+        hatch.isOpen = !hatch.isOpen;
+        this.pendingSounds.push({ type: 'door' });
+        break;
+      }
+
+      case 'USE_TUNNEL_SHAFT': {
+        const actor = this.state.actors[cmd.actorId];
+        const ladder = this.laddersById[cmd.ladderId];
+        if (!actor || !ladder || actor.climbState) return;
+        this.mountLadder(actor, ladder, cmd.direction);
+        break;
+      }
+
       case 'DISMOUNT_LADDER': {
         const actor = this.state.actors[cmd.actorId];
         if (!actor || !actor.climbState) return;
@@ -409,6 +787,47 @@ export class GameSimulation {
         break;
       }
 
+      case 'SELECT_TOOL': {
+        const actor = this.state.actors[cmd.actorId];
+        if (actor) actor.activeTool = cmd.tool;
+        break;
+      }
+
+      case 'USE_ACTIVE_TOOL': {
+        const actor = this.state.actors[cmd.actorId];
+        if (!actor || actor.climbState || actor.health <= 0) return;
+        if (actor.inShelter || actor.inTunnel) {
+          this.performActiveTool(actor);
+        } else {
+          // Above ground: fire equipped handheld weapon along player's aim vector!
+          const cosP = Math.cos(actor.pitch);
+          const aimTarget: Vec3 = {
+            x: actor.position.x - Math.sin(actor.yaw) * cosP * 24,
+            y: actor.position.y + 1.32 + Math.sin(actor.pitch) * 24,
+            z: actor.position.z - Math.cos(actor.yaw) * cosP * 24,
+          };
+          this.ingestPhase3Result(
+            handleFireWeapon(
+              this.state.phase3,
+              actor,
+              this.state.phase3.activeWeapon,
+              aimTarget,
+              this.state.actors,
+              this.state.socialFeed,
+              this.state.day,
+            ),
+          );
+        }
+        break;
+      }
+
+      case 'DIG': {
+        const actor = this.state.actors[cmd.actorId];
+        if (!actor || actor.climbState || actor.health <= 0) return;
+        this.performDigCell(actor, cmd.gx, cmd.gy, cmd.gz);
+        break;
+      }
+
       case 'SET_SLOT_CONTROLLER': {
         for (const actor of Object.values(this.state.actors)) {
           if (actor.slotId === cmd.slotId) {
@@ -423,13 +842,107 @@ export class GameSimulation {
         break;
       }
 
-      case 'DIG':
-      case 'BUILD':
-      case 'BUY':
-      case 'FIRE':
-      case 'CALL_911':
-      case 'POST_PHOTO':
+      case 'EQUIP_WEAPON': {
+        handleEquipWeapon(this.state.phase3, cmd.weaponId);
         break;
+      }
+
+      case 'BUY': {
+        const actor = this.state.actors[cmd.actorId];
+        if (!actor) return;
+        this.ingestPhase3Result(handleBuyShopItem(this.state.phase3, actor, cmd.itemId));
+        break;
+      }
+
+      case 'BUILD': {
+        const actor = this.state.actors[cmd.actorId];
+        if (!actor) return;
+        this.ingestPhase3Result(
+          handleBuildDefense(
+            this.state.phase3,
+            actor,
+            cmd.slotId,
+            cmd.itemId,
+            this.state.yardSlots,
+          ),
+        );
+        break;
+      }
+
+      case 'FIRE': {
+        const actor = this.state.actors[cmd.actorId];
+        if (!actor || actor.climbState || actor.health <= 0) return;
+        this.ingestPhase3Result(
+          handleFireWeapon(
+            this.state.phase3,
+            actor,
+            cmd.weaponId as WeaponId,
+            cmd.target,
+            this.state.actors,
+            this.state.socialFeed,
+            this.state.day,
+          ),
+        );
+        break;
+      }
+
+      case 'CALL_911': {
+        const actor = this.state.actors[cmd.actorId];
+        if (!actor) return;
+        this.ingestPhase3Result(
+          handleCall911(
+            this.state.phase3,
+            actor,
+            this.houses,
+            this.state.socialFeed,
+            this.state.day,
+          ),
+        );
+        break;
+      }
+
+      case 'POST_PHOTO': {
+        const actor = this.state.actors[cmd.actorId];
+        if (!actor) return;
+        this.ingestPhase3Result(
+          handlePostPhoto(
+            this.state.phase3,
+            actor,
+            cmd.captionKey,
+            this.state.socialFeed,
+            this.state.day,
+          ),
+        );
+        break;
+      }
+
+      case 'CLAIM_MISSION': {
+        const actor = this.state.actors[cmd.actorId];
+        if (!actor) return;
+        this.ingestPhase3Result(handleClaimMission(this.state.phase3, actor, cmd.missionId));
+        break;
+      }
+
+      case 'TRIGGER_RAID': {
+        const raidSounds = spawnNightRaid(
+          this.state.phase3,
+          this.houses,
+          this.state.doors,
+          this.rng,
+          this.state.day,
+          2,
+        );
+        for (const s of raidSounds) this.pendingSounds.push({ type: s.type });
+        if (raidSounds.length > 0) {
+          this.pendingToasts.push({ key: 'phase3.toast.raidStarted' });
+        }
+        break;
+      }
+
+      case 'CLEAR_FEED_UNREAD': {
+        this.state.phase3.unreadFeedCount = 0;
+        break;
+      }
     }
   }
 
@@ -464,6 +977,13 @@ export class GameSimulation {
       if (Math.abs(target - door.openProgress) < 0.005) door.openProgress = target;
     }
 
+    // Smoothly animate dual-casement windows
+    for (const win of Object.values(this.state.windows)) {
+      const target = win.isOpen ? 1 : 0;
+      win.openProgress += (target - win.openProgress) * Math.min(1, dt * 7.5);
+      if (Math.abs(target - win.openProgress) < 0.005) win.openProgress = target;
+    }
+
     // Smoothly animate shelter hatch trapdoors
     for (const hatch of Object.values(this.state.shelterHatches)) {
       const target = hatch.isOpen ? 1 : 0;
@@ -484,8 +1004,31 @@ export class GameSimulation {
       }
     }
 
-    // Step physics for all actors
+    // Step physics & underground survival rules for all actors
     for (const actor of Object.values(this.state.actors)) {
+      // Handle KO recovery cleanly (wake back up in home shelter so player never gets soft-locked)
+      if (actor.health <= 0) {
+        actor.animState = 'ko';
+        this.koRecoverTimers[actor.id] = (this.koRecoverTimers[actor.id] ?? 0) + dt;
+        if (this.koRecoverTimers[actor.id] >= 2.8) {
+          this.koRecoverTimers[actor.id] = 0;
+          actor.health = 55;
+          actor.oxygen = 100;
+          actor.stamina = 100;
+          actor.collapseWarningTimer = 0;
+          const home = this.houseById[actor.houseId];
+          const shAnchor = home?.anchors.find((a) => a.kind === 'shelterFloor');
+          if (shAnchor) {
+            actor.position = { ...shAnchor.position };
+            actor.inShelter = true;
+            actor.inTunnel = false;
+            actor.currentFloor = -1;
+          }
+          actor.velocity = { x: 0, y: 0, z: 0 };
+        }
+        continue;
+      }
+
       const input: MoveInputPayload = this.latestInputs[actor.id] ?? {
         forward: 0,
         right: 0,
@@ -514,35 +1057,116 @@ export class GameSimulation {
         if (res.jumped) this.pendingSounds.push({ type: 'jump', surface: actor.currentSurface });
         if (res.landed) this.pendingSounds.push({ type: 'land', surface: actor.currentSurface });
         const acc = (this.stepMeters[actor.id] ?? 0) + (actor.grounded ? res.stepDistance : 0);
-        // Sync footsteps tightly with walk/run foot-contact phase!
         const stride = actor.animState === 'run' ? 1.85 : 1.45;
         if (acc >= stride) {
           this.stepMeters[actor.id] = acc - stride;
-          this.pendingSounds.push({ type: 'footstep', surface: actor.currentSurface });
+          this.pendingSounds.push({
+            type: actor.inFloodedTunnel ? 'water_seep' : 'footstep',
+            surface: actor.currentSurface,
+          });
         } else {
           this.stepMeters[actor.id] = acc;
         }
       }
 
       this.updateActorHouseZone(actor);
+      this.stepActorUndergroundSurvival(actor, dt);
+    }
+
+    // Step Phase 3 combat, yard/roof defenses, guard dog, wildlife, robbers & 911 police
+    const p3Sounds = stepPhase3(
+      this.state.phase3,
+      this.state.actors,
+      this.state.doors,
+      this.state.windows,
+      this.houses,
+      this.spatialGrid,
+      this.state.socialFeed,
+      this.state.timeOfDay,
+      this.state.day,
+      this.rng,
+      dt,
+    );
+    for (let i = 0; i < p3Sounds.length; i++) {
+      this.pendingSounds.push({ type: p3Sounds[i].type });
     }
 
     this.state.rngState = this.rng.getState();
   }
 
-  public updateActorHouseZone(actor: ActorEntity): void {
-    actor.insideHouseId = null;
-    if (actor.inShelter || actor.position.y < -0.45) {
-      actor.currentFloor = -1;
-      for (const h of this.houses) {
-        const loc = worldToLocal(h.worldOrigin, h.rotationY, actor.position);
-        if (loc.x >= h.totalMinX - 1 && loc.x <= h.totalMaxX + 1 && loc.z >= h.totalMinZ - 1 && loc.z <= h.totalMaxZ + 1) {
-          actor.insideHouseId = h.houseId;
-          break;
+  private stepActorUndergroundSurvival(actor: ActorEntity, dt: number): void {
+    if (actor.caveInShakeTimer > 0) {
+      actor.caveInShakeTimer = Math.max(0, actor.caveInShakeTimer - dt);
+    }
+
+    if (actor.inTunnel) {
+      const { gx, gy, gz } = worldToGrid(actor.position.x, actor.position.y, actor.position.z);
+      const cellKey = tunnelCellKey(gx, Math.min(0, gy), gz);
+      const seg = this.tunnelSegmentMap.get(cellKey);
+      actor.inFloodedTunnel = Boolean(seg?.flooded);
+
+      // Oxygen / Ventilation rule
+      if (this.tunnelAir.freshAirKeys.has(cellKey)) {
+        actor.oxygen = Math.min(actor.maxOxygen, actor.oxygen + 28 * dt);
+      } else {
+        actor.oxygen = Math.max(0, actor.oxygen - 7.5 * dt);
+        if (actor.oxygen <= 0) {
+          actor.health = Math.max(0, actor.health - 4.0 * dt);
         }
       }
+
+      // Structural collapse instability rule
+      if (this.tunnelStability.unstableKeys.has(cellKey) || this.tunnelStability.collapseCandidateKey) {
+        actor.collapseWarningTimer += dt;
+        if (this.tunnelStability.collapseCandidateKey && actor.collapseWarningTimer >= 2.6) {
+          this.triggerCaveIn(actor);
+        }
+      } else {
+        actor.collapseWarningTimer = Math.max(0, actor.collapseWarningTimer - dt * 2.5);
+      }
+    } else {
+      actor.inFloodedTunnel = false;
+      actor.oxygen = Math.min(actor.maxOxygen, actor.oxygen + 40 * dt);
+      actor.collapseWarningTimer = 0;
+    }
+  }
+
+  public updateActorHouseZone(actor: ActorEntity): void {
+    actor.insideHouseId = null;
+    actor.inTunnel = false;
+
+    if (actor.position.y < -0.45) {
+      // Distinguish inside concrete shelter vs inside dug tunnel grid
+      const { gx, gy, gz } = worldToGrid(actor.position.x, actor.position.y, actor.position.z);
+      const seg = this.tunnelSegmentMap.get(tunnelCellKey(gx, Math.min(0, gy), gz));
+
+      // Check concrete shelter rooms first
+      for (const h of this.houses) {
+        const loc = worldToLocal(h.worldOrigin, h.rotationY, actor.position);
+        const rSh = h.rooms.find((r) => r.floorLevel === -1);
+        if (
+          rSh &&
+          loc.x >= rSh.minX - 0.15 &&
+          loc.x <= rSh.maxX + 0.15 &&
+          loc.z >= rSh.minZ - 0.15 &&
+          loc.z <= rSh.maxZ + 0.15
+        ) {
+          actor.insideHouseId = h.houseId;
+          actor.inShelter = true;
+          actor.inTunnel = false;
+          actor.currentFloor = -1;
+          return;
+        }
+      }
+
+      // Otherwise in tunnel (or climbing shaft)
+      actor.inShelter = false;
+      actor.inTunnel = Boolean(seg) || actor.position.y < -0.6;
+      actor.currentFloor = actor.position.y < HOUSE_CONSTANTS.SHELTER_Y - 1.5 ? -2 : -1;
       return;
     }
+
+    actor.inShelter = false;
 
     for (const h of this.houses) {
       const loc = worldToLocal(h.worldOrigin, h.rotationY, actor.position);
@@ -573,6 +1197,9 @@ export class GameSimulation {
   }
 
   public getActorLocationKey(actor: ActorEntity): string {
+    if (actor.inTunnel) {
+      return actor.currentFloor === -2 ? 'zone.tunnelDeep' : 'zone.tunnel';
+    }
     if (actor.inShelter || actor.currentFloor === -1) return 'zone.shelter';
     if (actor.insideHouseId) {
       if (actor.currentFloor === 2) return 'zone.roofDeck';
@@ -630,7 +1257,7 @@ export class GameSimulation {
       }
     };
 
-    // Doors
+    // Doors (includes Shelter Tunnel Bulkhead doors!)
     for (const d of Object.values(this.state.doors)) {
       const dist = Math.hypot(
         d.position.x - actor.position.x,
@@ -685,6 +1312,51 @@ export class GameSimulation {
       );
     }
 
+    // Tunnel vertical shaft ladders (surface breakout & deep shaft)
+    for (const l of Object.values(this.laddersById)) {
+      if (l.kind !== 'tunnel_shaft') continue;
+      const distBot = Math.hypot(
+        l.climbX - actor.position.x,
+        l.bottomY + 1.0 - eyeY,
+        l.climbZ - actor.position.z,
+      );
+      if (distBot <= 2.1) {
+        consider(
+          {
+            kind: 'shaft_up',
+            id: l.id,
+            houseId: l.houseId,
+            labelKey: l.topY >= -0.2 ? 'zone.yard' : 'zone.tunnel',
+            actionKey: l.topY >= -0.2 ? 'interact.climbSurfaceHatch' : 'interact.climbTunnelUp',
+            secondaryHintKey: 'interact.climbHint',
+            distance: distBot,
+            position: { x: l.climbX, y: l.bottomY, z: l.climbZ },
+          },
+          2.1,
+        );
+      }
+      const distTop = Math.hypot(
+        l.climbX - actor.position.x,
+        l.topY - actor.position.y,
+        l.climbZ - actor.position.z,
+      );
+      if (distTop <= 2.2) {
+        consider(
+          {
+            kind: 'shaft_down',
+            id: l.id,
+            houseId: l.houseId,
+            labelKey: 'zone.tunnel',
+            actionKey: 'interact.climbTunnelDown',
+            secondaryHintKey: 'interact.climbHint',
+            distance: distTop,
+            position: { x: l.climbX, y: l.topY, z: l.climbZ },
+          },
+          2.2,
+        );
+      }
+    }
+
     // Exterior roof ladders & underground shelter hatches
     for (const h of this.houses) {
       for (const a of h.anchors) {
@@ -693,7 +1365,7 @@ export class GameSimulation {
           a.position.y + 0.8 - eyeY,
           a.position.z - actor.position.z,
         );
-        if (a.kind === 'roofAccess' && !actor.inShelter && actor.position.y < 2.2) {
+        if (a.kind === 'roofAccess' && !actor.inShelter && !actor.inTunnel && actor.position.y < 2.2) {
           consider(
             {
               kind: 'roof_up',
@@ -721,70 +1393,115 @@ export class GameSimulation {
             },
             2.6,
           );
-        } else if (a.kind === 'shelterEntry' && !actor.inShelter && actor.currentFloor === 0) {
+        } else if (a.kind === 'shelterEntry' && !actor.inShelter && !actor.inTunnel && actor.currentFloor === 0) {
+          const hatchOpen = Boolean(this.state.shelterHatches[h.houseId]?.isOpen);
           consider(
             {
               kind: 'shelter_enter',
               id: a.id,
               houseId: h.houseId,
               labelKey: 'zone.shelter',
-              actionKey: 'interact.enterShelter',
-              secondaryHintKey: 'interact.climbHint',
+              actionKey: hatchOpen ? 'interact.climbShelterDown' : 'interact.enterShelter',
+              secondaryHintKey: hatchOpen ? 'interact.closeHatchHint' : 'interact.openHatchHint',
               distance: dist,
               position: a.position,
             },
             2.4,
           );
         } else if (a.kind === 'shelterFloor' && actor.inShelter) {
+          const hatchOpen = Boolean(this.state.shelterHatches[h.houseId]?.isOpen);
           consider(
             {
               kind: 'shelter_exit',
               id: a.id,
               houseId: h.houseId,
               labelKey: 'zone.garage',
-              actionKey: 'interact.exitShelter',
-              secondaryHintKey: 'interact.climbHint',
+              actionKey: hatchOpen ? 'interact.exitShelter' : 'interact.openAndExitShelter',
+              secondaryHintKey: hatchOpen ? 'interact.closeHatchHint' : 'interact.openHatchHint',
               distance: dist,
               position: a.position,
             },
             2.8,
           );
-        } else if (a.kind === 'tunnelEntry' && actor.inShelter) {
-          consider(
-            {
-              kind: 'tunnel_entry',
-              id: a.id,
-              houseId: h.houseId,
-              labelKey: 'interact.inspectTunnel',
-              actionKey: 'interact.inspectTunnel',
-              distance: dist,
-              position: a.position,
-            },
-            2.4,
-          );
         }
       }
     }
 
-    // Named Yard Slots
-    if (!actor.insideHouseId && !actor.inShelter) {
+    // Named Yard Slots (Phase 3 buildable & re-armable yard defenses)
+    if (!actor.insideHouseId && !actor.inShelter && !actor.inTunnel) {
       for (const s of Object.values(this.state.yardSlots)) {
         const dist = Math.hypot(
           s.position.x - actor.position.x,
           s.position.z - actor.position.z,
         );
-        if (dist > 2.0) continue;
+        if (dist > 2.35) continue;
+        const defId = YARD_SLOT_TO_DEFENSE[s.kind];
+        const spec = DEFENSE_SPECS[defId];
+        const existing = this.state.phase3.defenses[s.id];
+        const hasKit = (this.state.phase3.defenseKits[defId] ?? 0) > 0;
+        let actionKey = 'interact.buildSlot';
+        let actionParams: Record<string, string | number> = { cost: spec.price };
+        let stateBadgeKey: string | undefined;
+        if (existing) {
+          if (!existing.armed || existing.charges < spec.maxCharges) {
+            actionKey = 'interact.rearmSlot';
+            actionParams = { cost: spec.repairCost };
+            stateBadgeKey = 'interact.state.spent';
+          } else {
+            actionKey = 'interact.slotActive';
+            actionParams = {};
+            stateBadgeKey = 'interact.state.armed';
+          }
+        } else if (hasKit) {
+          actionKey = 'interact.placeKitSlot';
+          actionParams = {};
+        }
         consider(
           {
             kind: 'yard_slot',
             id: s.id,
             houseId: s.houseId,
-            labelKey: s.labelKey,
-            actionKey: 'interact.inspectSlot',
+            labelKey: spec.nameKey,
+            actionKey,
+            actionParams,
+            secondaryHintKey: existing ? undefined : 'interact.phoneShopHint',
+            stateBadgeKey,
             distance: dist,
             position: s.position,
           },
-          2.0,
+          2.35,
+        );
+      }
+    }
+
+    // Roof Equipment Staging Pads (Phase 3 roof defenses)
+    if (actor.currentFloor === 2) {
+      for (const pad of Object.values(this.state.phase3.roofPads)) {
+        const dist = Math.hypot(
+          pad.position.x - actor.position.x,
+          pad.position.z - actor.position.z,
+        );
+        if (dist > 2.5) continue;
+        const spec = DEFENSE_SPECS[pad.kind];
+        const existing = this.state.phase3.defenses[pad.id];
+        const hasKit = (this.state.phase3.defenseKits[pad.kind] ?? 0) > 0;
+        consider(
+          {
+            kind: 'roof_pad',
+            id: pad.id,
+            houseId: pad.houseId,
+            labelKey: spec.nameKey,
+            actionKey: existing
+              ? 'interact.slotActive'
+              : hasKit
+                ? 'interact.placeKitSlot'
+                : 'interact.buildSlot',
+            actionParams: existing || hasKit ? {} : { cost: spec.price },
+            stateBadgeKey: existing ? 'interact.state.armed' : undefined,
+            distance: dist,
+            position: pad.position,
+          },
+          2.5,
         );
       }
     }
@@ -802,11 +1519,14 @@ export class GameSimulation {
         pitch: a.pitch,
         health: a.health,
         stamina: a.stamina,
+        oxygen: a.oxygen,
         money: a.money,
         controller: a.controller,
         inShelter: a.inShelter,
+        inTunnel: a.inTunnel,
         currentFloor: a.currentFloor,
         insideHouseId: a.insideHouseId,
+        activeTool: a.activeTool,
       };
     }
 
@@ -852,8 +1572,12 @@ export class GameSimulation {
       windows,
       yardSlots,
       shelterHatches,
-      tunnels: this.state.tunnels,
+      tunnels: {
+        segments: this.state.tunnels.segments.map((s) => ({ ...s })),
+        digProgress: { ...(this.state.tunnels.digProgress ?? {}) },
+      },
       socialFeed: this.state.socialFeed,
+      phase3: serializePhase3State(this.state.phase3),
     };
   }
 
@@ -865,7 +1589,12 @@ export class GameSimulation {
     sim.state.day = data.day;
     sim.state.timeOfDay = data.timeOfDay;
     sim.state.localPlayerSlotId = data.localPlayerSlotId;
-    sim.state.tunnels = data.tunnels ?? createEmptyTunnelNetwork();
+    sim.state.tunnels = data.tunnels
+      ? {
+          segments: (data.tunnels.segments ?? []).map((s) => ({ ...s })),
+          digProgress: { ...(data.tunnels.digProgress ?? {}) },
+        }
+      : createEmptyTunnelNetwork();
     sim.state.socialFeed = data.socialFeed ?? [];
 
     for (const [id, savedActor] of Object.entries(data.actors ?? {})) {
@@ -876,11 +1605,14 @@ export class GameSimulation {
       target.pitch = savedActor.pitch;
       target.health = savedActor.health;
       target.stamina = savedActor.stamina;
+      target.oxygen = savedActor.oxygen ?? 100;
       target.money = savedActor.money;
       target.controller = savedActor.controller;
       target.inShelter = savedActor.inShelter;
+      target.inTunnel = savedActor.inTunnel ?? false;
       target.currentFloor = savedActor.currentFloor;
       target.insideHouseId = savedActor.insideHouseId;
+      target.activeTool = savedActor.activeTool ?? 'shovel';
       target.climbState = null;
       target.velocity = { x: 0, y: 0, z: 0 };
     }
@@ -901,6 +1633,7 @@ export class GameSimulation {
       target.isOpen = savedWin.isOpen;
       target.isBarricaded = savedWin.isBarricaded;
       target.damageState = savedWin.damageState;
+      target.openProgress = savedWin.isOpen ? 1 : 0;
     }
 
     for (const [id, savedSlot] of Object.entries(data.yardSlots ?? {})) {
@@ -916,6 +1649,8 @@ export class GameSimulation {
       target.openProgress = savedHatch.isOpen ? 1 : 0;
     }
 
+    hydratePhase3State(sim.state.phase3, data.phase3, sim.state.yardSlots);
+    sim.rebuildTunnelWorldState();
     return sim;
   }
 }

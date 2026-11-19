@@ -161,15 +161,18 @@ export function DebugOverlay({ enabled, simRef, cameraRayRef }: DebugOverlayProp
 
     // 2. Snap 1m x 1m architectural floor grid to player's current floor level
     if (floorGridRef.current) {
-      const gridY = player.inShelter
-        ? HOUSE_CONSTANTS.SHELTER_Y + 0.02
-        : player.currentFloor === 2
-          ? HOUSE_CONSTANTS.ROOF_Y + 0.02
-          : player.currentFloor === 1
-            ? HOUSE_CONSTANTS.SECOND_Y + 0.02
-            : player.insideHouseId
-              ? HOUSE_CONSTANTS.GROUND_Y + 0.02
-              : 0.03;
+      const gridY =
+        player.currentFloor === -2
+          ? HOUSE_CONSTANTS.SHELTER_Y - 3.2 + 0.02
+          : player.inShelter || player.inTunnel || player.currentFloor === -1
+            ? HOUSE_CONSTANTS.SHELTER_Y + 0.02
+            : player.currentFloor === 2
+              ? HOUSE_CONSTANTS.ROOF_Y + 0.02
+              : player.currentFloor === 1
+                ? HOUSE_CONSTANTS.SECOND_Y + 0.02
+                : player.insideHouseId
+                  ? HOUSE_CONSTANTS.GROUND_Y + 0.02
+                  : 0.03;
       floorGridRef.current.position.set(
         Math.round(player.position.x),
         gridY,

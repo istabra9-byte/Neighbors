@@ -275,15 +275,17 @@ export function stepActorPhysics(
   actor.yaw = input.yaw;
   actor.pitch = Math.max(-1.32, Math.min(1.32, input.pitch));
 
-  // Stamina & movement speed
+  // Stamina & movement speed (reduced in flooded tunnels & low oxygen)
   const wantsMove = Math.abs(input.forward) > 0.01 || Math.abs(input.right) > 0.01;
-  const canSprint = input.sprint && wantsMove && actor.stamina > 2;
+  const canSprint = input.sprint && wantsMove && actor.stamina > 2 && !actor.inFloodedTunnel;
   if (canSprint) {
     actor.stamina = Math.max(0, actor.stamina - 16 * dt);
   } else {
-    actor.stamina = Math.min(actor.maxStamina, actor.stamina + 22 * dt);
+    const regenRate = actor.oxygen < 25 ? 9 : 22;
+    actor.stamina = Math.min(actor.maxStamina, actor.stamina + regenRate * dt);
   }
-  const speed = canSprint ? PHYSICS.RUN_SPEED : PHYSICS.WALK_SPEED;
+  const baseSpeed = canSprint ? PHYSICS.RUN_SPEED : PHYSICS.WALK_SPEED;
+  const speed = actor.inFloodedTunnel ? baseSpeed * 0.56 : baseSpeed;
 
   // Desired horizontal velocity in world space (Three.js convention: yaw=0 faces -Z)
   const fwdX = -Math.sin(actor.yaw);
@@ -420,15 +422,20 @@ export function stepActorPhysics(
   const prevY = nextY;
   nextY += actor.velocity.y * dt;
 
-  let supportY = actor.inShelter ? HOUSE_CONSTANTS.SHELTER_Y : 0.0;
+  let supportY =
+    actor.inShelter || actor.inTunnel || actor.position.y < -0.45
+      ? HOUSE_CONSTANTS.SHELTER_Y - 12.0
+      : 0.0;
   let supportSurface: SurfaceKind =
     actor.inShelter
       ? 'concrete'
-      : Math.abs(nextZ) < STREET_CONFIG.roadWidth / 2
-        ? 'asphalt'
-        : Math.abs(nextZ) < STREET_CONFIG.roadWidth / 2 + STREET_CONFIG.sidewalkWidth
-          ? 'concrete'
-          : 'grass';
+      : actor.inTunnel
+        ? 'grass'
+        : Math.abs(nextZ) < STREET_CONFIG.roadWidth / 2
+          ? 'asphalt'
+          : Math.abs(nextZ) < STREET_CONFIG.roadWidth / 2 + STREET_CONFIG.sidewalkWidth
+            ? 'concrete'
+            : 'grass';
   let onStairNow = false;
   let activeStairSlope = 0;
 
@@ -515,6 +522,7 @@ export function stepActorPhysics(
   if (actor.hurtTimer > 0) actor.hurtTimer = Math.max(0, actor.hurtTimer - dt);
   if (actor.celebrateTimer > 0) actor.celebrateTimer = Math.max(0, actor.celebrateTimer - dt);
   if (actor.interactTimer > 0) actor.interactTimer = Math.max(0, actor.interactTimer - dt);
+  if (actor.digTimer > 0) actor.digTimer = Math.max(0, actor.digTimer - dt);
 
   // Determine procedural animation state (smoothly crossfaded inside CharacterMesh)
   const horizSpeed = movedDist / Math.max(dt, 1e-4);
@@ -523,6 +531,9 @@ export function stepActorPhysics(
     actor.idleTime = 0;
   } else if (actor.hurtTimer > 0) {
     actor.animState = 'hurt';
+    actor.idleTime = 0;
+  } else if (actor.digTimer > 0) {
+    actor.animState = 'dig';
     actor.idleTime = 0;
   } else if (actor.celebrateTimer > 0) {
     actor.animState = 'celebrate';

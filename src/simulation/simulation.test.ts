@@ -53,19 +53,30 @@ test('street layout supports 4, 6, and 8 lots with 40-60m spacing and left/right
   assert.equal(garageSides.size, 2, 'must include both left and right attached garages');
 });
 
-test('all 3 enlarged house archetypes have 18x14m footprint, 6x7m+ garage, railings, ramps, ladders, and pass walkability check', () => {
-  const sim = new GameSimulation(202611, 6);
+test('all 8 distinct house archetypes have full scale, varied plans, rich furniture, railings, ladders, and pass walkability check', () => {
+  const sim = new GameSimulation(202611, 8);
+  assert.equal(sim.houses.length, 8);
   const types = new Set(sim.houses.map((h) => h.lot.houseType));
-  assert.equal(types.size, 3);
+  assert.equal(types.size, 8, 'default 8-lot neighborhood must spawn all 8 distinct house architectures');
   assert.ok(types.has('brick_colonial'));
   assert.ok(types.has('craftsman_clapboard'));
   assert.ok(types.has('stucco_modern'));
+  assert.ok(types.has('tudor_manor'));
+  assert.ok(types.has('farmhouse_wrap'));
+  assert.ok(types.has('mediterranean_villa'));
+  assert.ok(types.has('nordic_gable'));
+  assert.ok(types.has('industrial_loft'));
+
+  // All 8 archetypes must use distinct room plan variants
+  const planVariants = new Set(sim.houses.map((h) => h.archetype.planVariant));
+  assert.equal(planVariants.size, 8, 'each of the 8 archetypes must have its own room plan variant');
 
   for (const h of sim.houses) {
     assert.ok(h.width >= 23.5 && h.depth >= 17.5, 'main footprint must be ~24x18m');
     assert.ok(h.garageWidth >= 7.5 && h.garageDepth >= 9.0, 'attached two-car garage must be >= 8x9.6m');
     assert.ok(h.doors.length >= 8, 'house must have front, back, garage, roof, and interior doors');
     assert.ok(h.windows.length >= 16, 'house must have exterior windows');
+    assert.ok(h.furniture.length >= 34, `house ${h.houseId} should be richly furnished, got ${h.furniture.length}`);
     assert.equal(h.yardSlots.length, 6);
     assert.ok(h.stairs.length >= 2);
     assert.ok(h.stairRamps.length >= 2);
@@ -84,13 +95,58 @@ test('all 3 enlarged house archetypes have 18x14m footprint, 6x7m+ garage, raili
     `Walkability issues found: ${sim.walkabilityReport.issues.join('; ')}`,
   );
 
-  // Street props (cars, trees, fences, hydrants, poles, benches, bins, mailboxes) must be indexed
-  assert.ok(sim.streetProps.colliders.length > 100, 'street props must register colliders');
-  assert.ok(sim.spatialGrid.count > 500, 'spatial hash grid must index all house + prop colliders');
+  // Street props (cars, trees, fences, hydrants, poles, benches, bins, mailboxes, sheds, patios) must be indexed
+  assert.ok(sim.streetProps.yardProps.length >= 24, 'backyards must include patios, grills, sheds, planters');
+  assert.ok(sim.streetProps.flowerBeds.length === 8, 'every lot should have a front flower bed');
+  assert.ok(sim.streetProps.colliders.length > 150, 'street props must register colliders');
+  assert.ok(sim.spatialGrid.count > 700, 'spatial hash grid must index all house + prop colliders');
+});
+
+test('casement windows animate openProgress smoothly 0 -> 1 -> 0 and shelter hatch toggles independently without climbing', () => {
+  const sim = new GameSimulation(202611, 8);
+  const player = sim.getLocalPlayer();
+  const house = sim.houseById[player.houseId];
+
+  // Test full-opening casement window animation
+  const winId = house.windows[0].id;
+  assert.equal(sim.state.windows[winId].openProgress, 0);
+  sim.applyCommand({ type: 'INTERACT_WINDOW', actorId: player.id, windowId: winId });
+  for (let i = 0; i < 45; i++) sim.step(1 / 60);
+  assert.equal(sim.state.windows[winId].isOpen, true);
+  assert.ok(sim.state.windows[winId].openProgress > 0.95, 'window openProgress should smoothly reach ~1.0');
+
+  sim.applyCommand({ type: 'INTERACT_WINDOW', actorId: player.id, windowId: winId });
+  for (let i = 0; i < 45; i++) sim.step(1 / 60);
+  assert.equal(sim.state.windows[winId].isOpen, false);
+  assert.ok(sim.state.windows[winId].openProgress < 0.05, 'window openProgress should smoothly return to ~0.0');
+
+  // Test shelter hatch toggle [R] opens & closes WITHOUT mounting the ladder
+  const shelterEntry = house.anchors.find((a) => a.kind === 'shelterEntry')!;
+  player.position = { ...shelterEntry.position };
+  const promptClosed = sim.findInteractionTarget(player);
+  assert.equal(promptClosed?.kind, 'shelter_enter');
+  assert.equal(promptClosed?.secondaryHintKey, 'interact.openHatchHint');
+
+  sim.applyCommand({ type: 'TOGGLE_SHELTER_HATCH', actorId: player.id, houseId: house.houseId });
+  for (let i = 0; i < 40; i++) sim.step(1 / 60);
+  assert.equal(player.climbState, null, 'toggling hatch must NOT force player onto ladder');
+  assert.equal(sim.state.shelterHatches[house.houseId].isOpen, true);
+  assert.ok(sim.state.shelterHatches[house.houseId].openProgress > 0.95);
+
+  const promptOpen = sim.findInteractionTarget(player);
+  assert.equal(promptOpen?.kind, 'shelter_enter');
+  assert.equal(promptOpen?.secondaryHintKey, 'interact.closeHatchHint');
+
+  // Toggle closed again
+  sim.applyCommand({ type: 'TOGGLE_SHELTER_HATCH', actorId: player.id, houseId: house.houseId });
+  for (let i = 0; i < 40; i++) sim.step(1 / 60);
+  assert.equal(player.climbState, null, 'closing hatch must NOT force player onto ladder');
+  assert.equal(sim.state.shelterHatches[house.houseId].isOpen, false);
+  assert.ok(sim.state.shelterHatches[house.houseId].openProgress < 0.05);
 });
 
 test('real ladder and shelter hatch climb sequence works smoothly with zero teleporting', () => {
-  const sim = new GameSimulation(202611, 6);
+  const sim = new GameSimulation(202611, 8);
   const player = sim.getLocalPlayer();
   const house = sim.houseById[player.houseId];
 
@@ -137,7 +193,7 @@ test('real ladder and shelter hatch climb sequence works smoothly with zero tele
 });
 
 test('idle AI neighbor runs through command queue and save/load round-trips cleanly', () => {
-  const sim = new GameSimulation(777, 6);
+  const sim = new GameSimulation(777, 8);
   const gary = sim.state.actors['actor_neighbor_1'];
   assert.ok(gary);
   assert.equal(gary.controller, 'ai');

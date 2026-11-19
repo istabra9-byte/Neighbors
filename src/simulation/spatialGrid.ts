@@ -129,6 +129,34 @@ export class SpatialHashGrid {
     }
   }
 
+  public removeByPrefix(prefix: string): void {
+    let anyRemoved = false;
+    for (let i = this.allBoxes.length - 1; i >= 0; i--) {
+      if (this.allBoxes[i].id.startsWith(prefix)) {
+        this.allBoxes.splice(i, 1);
+        anyRemoved = true;
+      }
+    }
+    if (!anyRemoved) return;
+    for (const [cellKey, list] of this.cells.entries()) {
+      let changed = false;
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (list[i].id.startsWith(prefix)) {
+          list.splice(i, 1);
+          changed = true;
+        }
+      }
+      if (changed && list.length === 0) {
+        this.cells.delete(cellKey);
+      }
+    }
+  }
+
+  public replaceByPrefix(prefix: string, boxes: readonly AABB[]): void {
+    this.removeByPrefix(prefix);
+    this.insertMany(boxes);
+  }
+
   public get count(): number {
     return this.allBoxes.length;
   }

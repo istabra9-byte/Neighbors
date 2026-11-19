@@ -15,10 +15,15 @@ import * as THREE from 'three';
 import type { GameSimulation } from '../simulation/simulation';
 import type { AABB, InteractionTarget } from '../simulation/types';
 import type { CameraMode, LocalSettings, QualityPreset } from '../storage/localSettings';
+import { TOOL_ORDER } from '../tunnels/tunnelEngine';
+import type { SoilLayerType, TunnelToolId } from '../tunnels/tunnelTypes';
+import { WEAPON_ORDER, type WeaponId } from '../phase3/phase3Types';
 import { soundEngine } from '../audio/soundEngine';
 import { SkyAndLighting } from './SkyAndLighting';
 import { StreetEnvironment } from './StreetEnvironment';
 import { HouseView } from './HouseView';
+import { TunnelView } from './TunnelView';
+import { Phase3EntitiesView } from './Phase3EntitiesView';
 import { CharacterMesh } from './CharacterMesh';
 import { FirstPersonRig } from './FirstPersonRig';
 import { DebugOverlay, type CameraRayDebugData } from './DebugOverlay';
@@ -38,6 +43,18 @@ export interface HudDebugInfo {
   walkabilityIssues: number;
 }
 
+export interface HudDigTargetSnapshot {
+  tool: TunnelToolId;
+  actionKind: 'dig' | 'support' | 'light' | 'vent' | 'drain';
+  gy: number;
+  soil: SoilLayerType;
+  valid: boolean;
+  reasonKey?: string;
+  hitsDone: number;
+  hitsMax: number;
+  cost: number;
+}
+
 export interface HudSnapshot {
   day: number;
   timeOfDay: number;
@@ -45,16 +62,31 @@ export interface HudSnapshot {
   health: number;
   maxHealth: number;
   stamina: number;
+  oxygen: number;
+  maxOxygen: number;
   money: number;
   locationKey: string;
   interaction: InteractionTarget | null;
+  digTarget: HudDigTargetSnapshot | null;
   isClimbing: boolean;
   playerX: number;
   playerY: number;
   playerZ: number;
   floorLevel: number;
   inShelter: boolean;
+  inTunnel: boolean;
+  inFloodedTunnel: boolean;
+  activeTool: TunnelToolId;
+  collapseWarning: boolean;
+  tunnelCount: number;
   pointerLocked: boolean;
+  activeWeapon: WeaponId;
+  ownedWeapons: WeaponId[];
+  weaponAmmo: Record<WeaponId, number>;
+  activeRobberCount: number;
+  policeStatus: 'idle' | 'en_route' | 'on_scene' | 'departing';
+  raidBannerKey: string | null;
+  phoneBadgeCount: number;
   debugInfo?: HudDebugInfo;
 }
 
@@ -71,14 +103,19 @@ export interface MobileInputState {
 interface GameCanvasProps {
   simRef: React.MutableRefObject<GameSimulation>;
   shellState: GameShellState;
+  phoneOpen: boolean;
   settings: LocalSettings;
   debugMode: boolean;
   isSoftwareGl: boolean;
   isNight: boolean;
   mobileInputRef: React.MutableRefObject<MobileInputState>;
   onHudUpdate: (snap: HudSnapshot) => void;
+  onSimToast?: (key: string, params?: Record<string, string | number>) => void;
   onAutoQualityDown?: (nextQuality: QualityPreset) => void;
   onInteractRequest?: (secondary: 'lock' | 'barricade' | null) => void;
+  onSelectTool?: (tool: TunnelToolId) => void;
+  onEquipWeapon?: (weapon: WeaponId) => void;
+  onUseActiveTool?: () => void;
   sceneRevision: number;
 }
 
@@ -96,12 +133,17 @@ const _upVec = new THREE.Vector3();
 interface InnerSceneProps {
   simRef: React.MutableRefObject<GameSimulation>;
   shellStateRef: React.MutableRefObject<GameShellState>;
+  phoneOpenRef: React.MutableRefObject<boolean>;
   settingsRef: React.MutableRefObject<LocalSettings>;
   debugModeRef: React.MutableRefObject<boolean>;
   mobileInputRef: React.MutableRefObject<MobileInputState>;
   onHudUpdateRef: React.MutableRefObject<(snap: HudSnapshot) => void>;
+  onSimToastRef: React.MutableRefObject<((key: string, params?: Record<string, string | number>) => void) | undefined>;
   onAutoQualityDownRef: React.MutableRefObject<((q: QualityPreset) => void) | undefined>;
   onInteractRequestRef: React.MutableRefObject<((sec: 'lock' | 'barricade' | null) => void) | undefined>;
+  onSelectToolRef: React.MutableRefObject<((tool: TunnelToolId) => void) | undefined>;
+  onEquipWeaponRef: React.MutableRefObject<((weapon: WeaponId) => void) | undefined>;
+  onUseActiveToolRef: React.MutableRefObject<(() => void) | undefined>;
   cameraMode: CameraMode;
   quality: QualityPreset;
   debugMode: boolean;
@@ -112,12 +154,17 @@ interface InnerSceneProps {
 function InnerScene({
   simRef,
   shellStateRef,
+  phoneOpenRef,
   settingsRef,
   debugModeRef,
   mobileInputRef,
   onHudUpdateRef,
+  onSimToastRef,
   onAutoQualityDownRef,
   onInteractRequestRef,
+  onSelectToolRef,
+  onEquipWeaponRef,
+  onUseActiveToolRef,
   cameraMode,
   quality,
   debugMode,
@@ -130,6 +177,7 @@ function InnerScene({
   const jumpJustPressedRef = useRef(false);
   const pointerLockedRef = useRef(false);
   const draggingLookRef = useRef(false);
+  const mouseDownPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const lastMouseRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const yawRef = useRef(0.22);
   const pitchRef = useRef(-0.06);
@@ -162,7 +210,7 @@ function InnerScene({
     const dom = gl.domElement;
 
     const onKeyDown = (e: KeyboardEvent) => {
-      if (shellStateRef.current !== 'playing') return;
+      if (shellStateRef.current !== 'playing' || phoneOpenRef.current) return;
       soundEngine.unlock();
 
       const code = e.code;
@@ -178,6 +226,21 @@ function InnerScene({
         onInteractRequestRef.current?.('lock');
       } else if (code === 'KeyB' && !alreadyHeld) {
         onInteractRequestRef.current?.('barricade');
+      } else if (code === 'KeyF' && !alreadyHeld) {
+        onUseActiveToolRef.current?.();
+      } else if (!alreadyHeld && code.startsWith('Digit')) {
+        const idx = Number(code.slice(5)) - 1;
+        const p = simRef.current.getLocalPlayer();
+        if (p && (p.inShelter || p.inTunnel)) {
+          if (idx >= 0 && idx < TOOL_ORDER.length) {
+            onSelectToolRef.current?.(TOOL_ORDER[idx]);
+          }
+        } else if (idx >= 0 && idx < WEAPON_ORDER.length) {
+          const w = WEAPON_ORDER[idx];
+          if (simRef.current.state.phase3.ownedWeapons.includes(w)) {
+            onEquipWeaponRef.current?.(w);
+          }
+        }
       }
     };
 
@@ -196,10 +259,15 @@ function InnerScene({
     };
 
     const onMouseDown = (e: MouseEvent) => {
-      if (shellStateRef.current !== 'playing') return;
+      if (shellStateRef.current !== 'playing' || phoneOpenRef.current) return;
       soundEngine.unlock();
       if (e.button === 0) {
+        if (pointerLockedRef.current) {
+          onUseActiveToolRef.current?.();
+          return;
+        }
         draggingLookRef.current = true;
+        mouseDownPosRef.current = { x: e.clientX, y: e.clientY };
         lastMouseRef.current = { x: e.clientX, y: e.clientY };
         if (document.pointerLockElement !== dom && dom.requestPointerLock && !isSoftwareGl) {
           try {
@@ -211,12 +279,46 @@ function InnerScene({
       }
     };
 
-    const onMouseUp = () => {
+    const onMouseUp = (e: MouseEvent) => {
+      if (
+        draggingLookRef.current &&
+        e.button === 0 &&
+        !pointerLockedRef.current &&
+        !phoneOpenRef.current
+      ) {
+        const dragDist = Math.hypot(
+          e.clientX - mouseDownPosRef.current.x,
+          e.clientY - mouseDownPosRef.current.y,
+        );
+        if (dragDist < 6) {
+          onUseActiveToolRef.current?.();
+        }
+      }
       draggingLookRef.current = false;
     };
 
+    const onWheel = (e: WheelEvent) => {
+      if (shellStateRef.current !== 'playing' || phoneOpenRef.current) return;
+      const p = simRef.current.getLocalPlayer();
+      if (!p) return;
+      if (p.inTunnel || p.inShelter) {
+        const curIdx = TOOL_ORDER.indexOf(p.activeTool);
+        const step = e.deltaY > 0 ? 1 : -1;
+        const nextIdx = (curIdx + step + TOOL_ORDER.length) % TOOL_ORDER.length;
+        onSelectToolRef.current?.(TOOL_ORDER[nextIdx]);
+      } else {
+        const owned = simRef.current.state.phase3.ownedWeapons;
+        if (owned.length > 1) {
+          const curIdx = owned.indexOf(simRef.current.state.phase3.activeWeapon);
+          const step = e.deltaY > 0 ? 1 : -1;
+          const nextIdx = (curIdx + step + owned.length) % owned.length;
+          onEquipWeaponRef.current?.(owned[nextIdx]);
+        }
+      }
+    };
+
     const onMouseMove = (e: MouseEvent) => {
-      if (shellStateRef.current !== 'playing') return;
+      if (shellStateRef.current !== 'playing' || phoneOpenRef.current) return;
       const sens = 0.0022 * settingsRef.current.mouseSensitivity;
       if (pointerLockedRef.current) {
         yawRef.current -= e.movementX * sens;
@@ -244,6 +346,7 @@ function InnerScene({
     document.addEventListener('visibilitychange', clearInputs);
     document.addEventListener('pointerlockchange', onPointerLockChange);
     dom.addEventListener('mousedown', onMouseDown);
+    dom.addEventListener('wheel', onWheel, { passive: true });
     window.addEventListener('mouseup', onMouseUp);
     window.addEventListener('mousemove', onMouseMove);
 
@@ -254,10 +357,22 @@ function InnerScene({
       document.removeEventListener('visibilitychange', clearInputs);
       document.removeEventListener('pointerlockchange', onPointerLockChange);
       dom.removeEventListener('mousedown', onMouseDown);
+      dom.removeEventListener('wheel', onWheel);
       window.removeEventListener('mouseup', onMouseUp);
       window.removeEventListener('mousemove', onMouseMove);
     };
-  }, [gl, isSoftwareGl, onInteractRequestRef, settingsRef, shellStateRef]);
+  }, [
+    gl,
+    isSoftwareGl,
+    onEquipWeaponRef,
+    onInteractRequestRef,
+    onSelectToolRef,
+    onUseActiveToolRef,
+    phoneOpenRef,
+    settingsRef,
+    shellStateRef,
+    simRef,
+  ]);
 
   // Software-WebGL fenceSync `afterDraw()` demand loop so SwiftShader stays completely responsive
   useEffect(() => {
@@ -407,6 +522,10 @@ function InnerScene({
     for (let i = 0; i < sounds.length; i++) {
       soundEngine.playEvent(sounds[i]);
     }
+    const toasts = sim.drainToastEvents();
+    for (let i = 0; i < toasts.length; i++) {
+      onSimToastRef.current?.(toasts[i].key, toasts[i].params);
+    }
 
     // Shared collider filter for camera raycasts
     const camColliderFilter = (b: AABB): boolean => {
@@ -472,16 +591,18 @@ function InnerScene({
     } else {
       // Third-person collision-aware over-the-shoulder camera with sphere-swept multi-raycast
       const isClimbing = player.climbState !== null;
-      const shoulderOffset = isClimbing ? 0.24 : 0.48;
+      const shoulderOffset = isClimbing || player.inTunnel ? 0.24 : 0.48;
       const distBack = isClimbing
-        ? player.climbState!.kind === 'shelter'
-          ? 2.4
+        ? player.climbState!.kind === 'shelter' || player.climbState!.kind === 'tunnel_shaft'
+          ? 2.2
           : 3.6
-        : player.inShelter
-          ? 2.8
-          : player.insideHouseId
-            ? 3.6
-            : 4.6;
+        : player.inTunnel
+          ? 2.25
+          : player.inShelter
+            ? 2.8
+            : player.insideHouseId
+              ? 3.6
+              : 4.6;
       const clampedPitch = THREE.MathUtils.clamp(pitch, -0.78, 0.68);
 
       const cosP = Math.cos(clampedPitch);
@@ -578,9 +699,11 @@ function InnerScene({
       }
 
       const dUse = currentCamDistRef.current;
-      const minCamY = player.inShelter
-        ? player.position.y + 0.42
-        : player.climbState?.kind === 'shelter'
+      const minCamY =
+        player.inShelter ||
+        player.inTunnel ||
+        player.climbState?.kind === 'shelter' ||
+        player.climbState?.kind === 'tunnel_shaft'
           ? player.position.y + 0.35
           : 0.32;
 
@@ -618,12 +741,25 @@ function InnerScene({
       };
     }
 
+    // Subtle cave-in camera tremor
+    if (player.caveInShakeTimer > 0) {
+      const amp = Math.min(0.11, player.caveInShakeTimer * 0.16);
+      camera.position.x += Math.sin(now * 0.055) * amp;
+      camera.position.y += Math.cos(now * 0.072) * amp * 0.7;
+    }
+
     // Throttled HUD snapshot push (~8 Hz)
     hudTimerRef.current += dt;
     if (hudTimerRef.current >= 0.12) {
       hudTimerRef.current = 0;
       const interaction = sim.findInteractionTarget(player);
+      const activeTarget = sim.getActiveTunnelTarget(player);
       const report = sim.walkabilityReport;
+      const p3 = sim.state.phase3;
+      const activeRobberCount = p3.robbers.filter(
+        (r) => r.state !== 'arrested' && r.state !== 'stunned',
+      ).length;
+      const claimableMissions = p3.missions.filter((m) => m.completed && !m.claimed).length;
       onHudUpdateRef.current({
         day: sim.state.day,
         timeOfDay: sim.state.timeOfDay,
@@ -631,16 +767,43 @@ function InnerScene({
         health: Math.round(player.health),
         maxHealth: player.maxHealth,
         stamina: Math.round(player.stamina),
+        oxygen: Math.round(player.oxygen),
+        maxOxygen: player.maxOxygen,
         money: Math.round(player.money),
         locationKey: sim.getActorLocationKey(player),
         interaction,
+        digTarget: activeTarget
+          ? {
+              tool: activeTarget.tool,
+              actionKind: activeTarget.actionKind,
+              gy: activeTarget.gy,
+              soil: activeTarget.soil,
+              valid: activeTarget.valid,
+              reasonKey: activeTarget.reasonKey,
+              hitsDone: activeTarget.hitsDone,
+              hitsMax: activeTarget.hitsMax,
+              cost: activeTarget.cost,
+            }
+          : null,
         isClimbing: player.climbState !== null,
         playerX: player.position.x,
         playerY: player.position.y,
         playerZ: player.position.z,
         floorLevel: player.currentFloor,
         inShelter: player.inShelter,
+        inTunnel: player.inTunnel,
+        inFloodedTunnel: player.inFloodedTunnel,
+        activeTool: player.activeTool,
+        collapseWarning: player.collapseWarningTimer > 0.1,
+        tunnelCount: sim.state.tunnels.segments.length,
         pointerLocked: pointerLockedRef.current,
+        activeWeapon: p3.activeWeapon,
+        ownedWeapons: [...p3.ownedWeapons],
+        weaponAmmo: { ...p3.ammo },
+        activeRobberCount,
+        policeStatus: p3.police.status,
+        raidBannerKey: p3.raidBannerKey,
+        phoneBadgeCount: activeRobberCount + claimableMissions + p3.unreadFeedCount,
         debugInfo: debugModeRef.current
           ? {
               animState: player.animState,
@@ -667,6 +830,7 @@ function InnerScene({
 
       <StreetEnvironment
         streetProps={sim.streetProps}
+        houses={sim.houses}
         roadLength={sim.roadLength}
         isNight={isNight}
       />
@@ -680,6 +844,12 @@ function InnerScene({
           isNight={isNight}
         />
       ))}
+
+      {/* Phase 2 Underground Tunnel Network, Strata, Props & Particle Bursts */}
+      <TunnelView simRef={simRef} />
+
+      {/* Phase 3 Yard/Roof Defenses, Guard Dog & Wildlife, Night Robbers, 911 Police & Projectiles */}
+      <Phase3EntitiesView simRef={simRef} isNight={isNight} />
 
       {/* Player Character (~1.65m stylized-survival rig with close-camera opacity fade) */}
       <CharacterMesh
@@ -697,10 +867,14 @@ function InnerScene({
         isNeighbor={true}
       />
 
-      {/* First-person sleeved forearms, work gloves & flashlight */}
+      {/* First-person sleeved forearms, work gloves & equipped Phase 3 weapon / tunnel tool */}
       <FirstPersonRig
         enabled={cameraMode === 'first' && shellStateRef.current === 'playing'}
         getPlayer={() => simRef.current.state.actors['actor_player']}
+        getActiveWeapon={() => ({
+          weapon: simRef.current.state.phase3.activeWeapon,
+          recoil: simRef.current.state.phase3.recoilTimer,
+        })}
         isNight={isNight}
       />
 
@@ -726,18 +900,26 @@ function InnerScene({
 export function GameCanvas({
   simRef,
   shellState,
+  phoneOpen,
   settings,
   debugMode,
   isSoftwareGl,
   isNight,
   mobileInputRef,
   onHudUpdate,
+  onSimToast,
   onAutoQualityDown,
   onInteractRequest,
+  onSelectTool,
+  onEquipWeapon,
+  onUseActiveTool,
   sceneRevision,
 }: GameCanvasProps) {
   const shellStateRef = useRef(shellState);
   shellStateRef.current = shellState;
+
+  const phoneOpenRef = useRef(phoneOpen);
+  phoneOpenRef.current = phoneOpen;
 
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -748,11 +930,23 @@ export function GameCanvas({
   const onHudUpdateRef = useRef(onHudUpdate);
   onHudUpdateRef.current = onHudUpdate;
 
+  const onSimToastRef = useRef(onSimToast);
+  onSimToastRef.current = onSimToast;
+
   const onAutoQualityDownRef = useRef(onAutoQualityDown);
   onAutoQualityDownRef.current = onAutoQualityDown;
 
   const onInteractRequestRef = useRef(onInteractRequest);
   onInteractRequestRef.current = onInteractRequest;
+
+  const onSelectToolRef = useRef(onSelectTool);
+  onSelectToolRef.current = onSelectTool;
+
+  const onEquipWeaponRef = useRef(onEquipWeapon);
+  onEquipWeaponRef.current = onEquipWeapon;
+
+  const onUseActiveToolRef = useRef(onUseActiveTool);
+  onUseActiveToolRef.current = onUseActiveTool;
 
   const dpr: [number, number] | number = useMemo(() => {
     if (isSoftwareGl) return 1;
@@ -782,12 +976,17 @@ export function GameCanvas({
         <InnerScene
           simRef={simRef}
           shellStateRef={shellStateRef}
+          phoneOpenRef={phoneOpenRef}
           settingsRef={settingsRef}
           debugModeRef={debugModeRef}
           mobileInputRef={mobileInputRef}
           onHudUpdateRef={onHudUpdateRef}
+          onSimToastRef={onSimToastRef}
           onAutoQualityDownRef={onAutoQualityDownRef}
           onInteractRequestRef={onInteractRequestRef}
+          onSelectToolRef={onSelectToolRef}
+          onEquipWeaponRef={onEquipWeaponRef}
+          onUseActiveToolRef={onUseActiveToolRef}
           cameraMode={settings.cameraMode}
           quality={settings.quality}
           debugMode={debugMode}

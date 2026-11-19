@@ -33,7 +33,11 @@ export function loadGameFromStorage(): SerializedGameState | null {
     const raw = window.localStorage.getItem(SAVE_STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as SerializedGameState;
-    if (!parsed || parsed.version !== SAVE_VERSION || typeof parsed.seed !== 'number') {
+    if (
+      !parsed ||
+      (parsed.version !== SAVE_VERSION && parsed.version !== 3 && parsed.version !== 2) ||
+      typeof parsed.seed !== 'number'
+    ) {
       return null;
     }
     return parsed;

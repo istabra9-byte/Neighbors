@@ -81,6 +81,7 @@ export function CharacterMesh({
 
   const customModelHostRef = useRef<THREE.Group>(null);
   const proceduralGroupRef = useRef<THREE.Group>(null);
+  const rightToolRef = useRef<THREE.Group>(null);
   const lastOpacityRef = useRef<number>(1.0);
 
   const initialActor = getActor();
@@ -320,6 +321,23 @@ export function CharacterMesh({
       rKneeX = Math.max(0.05, step * 0.25);
       lShZ = 0.14;
       rShZ = -0.14;
+    } else if (state === 'dig') {
+      // Energetic two-handed shovel thrust & heave
+      const swing = Math.sin(t * 22);
+      hipsY = 0.72 + Math.max(0, swing) * 0.03;
+      spineRotX = -0.26 - swing * 0.16;
+      spineRotY = -0.22 + swing * 0.18;
+      headRotX = -0.15;
+      rShX = -1.45 - swing * 0.65;
+      rElX = -0.65 + swing * 0.35;
+      rShZ = -0.14;
+      lShX = -1.15 - swing * 0.45;
+      lElX = -0.75 + swing * 0.25;
+      lShZ = 0.22;
+      lHipX = -0.22;
+      lKneeX = 0.35;
+      rHipX = 0.18;
+      rKneeX = 0.22;
     } else if (state === 'interact') {
       spineRotX = -0.12;
       spineRotY = -0.16;
@@ -437,6 +455,11 @@ export function CharacterMesh({
     rHip.rotation.x = damp(rHip.rotation.x, rHipX, blendRate, dt);
     rKnee.rotation.x = damp(rKnee.rotation.x, rKneeX, blendRate, dt);
     rFoot.rotation.x = damp(rFoot.rotation.x, rFootX, blendRate, dt);
+
+    if (rightToolRef.current) {
+      rightToolRef.current.visible =
+        !isNeighbor && !actor.climbState && (state === 'dig' || actor.inTunnel || actor.inShelter);
+    }
 
     // Expressive face animations: natural blinking + reactive eyebrows + mouth!
     const blinkCycle = (t + (isNeighbor ? 1.4 : 0)) % 3.8;
@@ -691,6 +714,21 @@ export function CharacterMesh({
                 <mesh position={[-0.032, -0.255, -0.032]} material={mats.gloves}>
                   <sphereGeometry args={[0.022, 6, 6]} />
                 </mesh>
+                {/* Held Shovel / Digging Tool (visible underground or while digging) */}
+                <group ref={rightToolRef} position={[0, -0.27, -0.04]} rotation={[Math.PI / 2.2, 0, 0]} visible={false}>
+                  <mesh position={[0, 0.25, 0]}>
+                    <cylinderGeometry args={[0.02, 0.022, 0.96, 8]} />
+                    <meshStandardMaterial color="#7d5c3e" roughness={0.82} />
+                  </mesh>
+                  <mesh position={[0, -0.28, 0.02]} rotation={[0.14, 0, 0]}>
+                    <boxGeometry args={[0.19, 0.24, 0.022]} />
+                    <meshStandardMaterial color="#585e64" metalness={0.72} roughness={0.4} />
+                  </mesh>
+                  <mesh position={[0, 0.74, 0]} rotation={[0, 0, Math.PI / 2]}>
+                    <cylinderGeometry args={[0.022, 0.022, 0.13, 6]} />
+                    <meshStandardMaterial color="#543e2a" roughness={0.85} />
+                  </mesh>
+                </group>
               </group>
             </group>
           </group>

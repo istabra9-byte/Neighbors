@@ -38,6 +38,7 @@ export function SkyAndLighting({ simRef, quality, isSoftwareGl }: SkyAndLighting
   const { scene, gl } = useThree();
   const dirLightRef = useRef<THREE.DirectionalLight>(null);
   const hemiLightRef = useRef<THREE.HemisphereLight>(null);
+  const interiorFillRef = useRef<THREE.PointLight>(null);
   const sunMeshRef = useRef<THREE.Mesh>(null);
   const moonMeshRef = useRef<THREE.Mesh>(null);
   const skyMatRef = useRef<THREE.ShaderMaterial>(null);
@@ -47,7 +48,7 @@ export function SkyAndLighting({ simRef, quality, isSoftwareGl }: SkyAndLighting
     const pmrem = new THREE.PMREMGenerator(gl);
     const envRT = pmrem.fromScene(new RoomEnvironment(), 0.04);
     scene.environment = envRT.texture;
-    scene.environmentIntensity = 0.45;
+    scene.environmentIntensity = 0.54;
     pmrem.dispose();
     return () => {
       scene.environment = null;
@@ -57,7 +58,7 @@ export function SkyAndLighting({ simRef, quality, isSoftwareGl }: SkyAndLighting
 
   // Configure far-distance fog so near & midground stay razor sharp
   useEffect(() => {
-    scene.fog = new THREE.Fog('#c7d5de', 105, 240);
+    scene.fog = new THREE.Fog('#c7d5de', 120, 275);
     scene.background = new THREE.Color('#c7d5de');
   }, [scene]);
 
@@ -83,7 +84,6 @@ export function SkyAndLighting({ simRef, quality, isSoftwareGl }: SkyAndLighting
           float h = clamp(vWorldDir.y, 0.0, 1.0);
           float blend = pow(h, 0.52);
           vec3 col = mix(uHorizon, uZenith, blend);
-          // Subtle high-altitude atmospheric wisps (never hazy)
           float band = sin(vWorldDir.x * 7.0 + vWorldDir.z * 5.0) * sin(vWorldDir.z * 9.0 - vWorldDir.x * 4.0);
           float cloudMask = smoothstep(0.45, 0.88, band) * smoothstep(0.08, 0.25, h) * (1.0 - smoothstep(0.45, 0.78, h));
           col = mix(col, mix(uHorizon, vec3(0.95, 0.94, 0.91), 0.55), cloudMask * 0.24);
@@ -96,7 +96,7 @@ export function SkyAndLighting({ simRef, quality, isSoftwareGl }: SkyAndLighting
 
   const shadowMapSize = quality === 'high' ? 2048 : quality === 'medium' ? 1024 : 512;
 
-  useFrame(() => {
+  useFrame((_, delta) => {
     const sim = simRef.current;
     const t = sim.state.timeOfDay; // 0..24
     const player = sim.getLocalPlayer();
@@ -105,22 +105,21 @@ export function SkyAndLighting({ simRef, quality, isSoftwareGl }: SkyAndLighting
     const sunAngle = ((t - 6) / 24) * Math.PI * 2;
     const sunElevation = Math.sin(sunAngle); // -1..1
     const sunHorizontal = Math.cos(sunAngle);
-    const orbitR = 175;
+    const orbitR = 185;
 
     const sx = sunHorizontal * orbitR;
     const sy = sunElevation * orbitR;
-    const sz = -45;
+    const sz = -48;
 
     if (sunMeshRef.current) {
       sunMeshRef.current.position.set(sx, sy, sz);
       sunMeshRef.current.visible = sunElevation > -0.08;
     }
     if (moonMeshRef.current) {
-      moonMeshRef.current.position.set(-sx, -sy, 45);
+      moonMeshRef.current.position.set(-sx, -sy, 48);
       moonMeshRef.current.visible = sunElevation < 0.1;
     }
 
-    // Smooth day / dusk / night color blend
     const dayFactor = THREE.MathUtils.smoothstep(sunElevation, -0.1, 0.28);
     const duskFactor = Math.exp(-Math.pow((sunElevation - 0.05) / 0.18, 2));
 
@@ -138,13 +137,17 @@ export function SkyAndLighting({ simRef, quality, isSoftwareGl }: SkyAndLighting
       scene.background.copy(_horizon);
     }
 
-    // Update Directional Key Light (follows player smoothly for crisp shadow resolution)
+    // Attenuate surface daylight inside underground tunnels so lanterns & headlamp pop
+    const undergroundTunnel = Boolean(player && player.inTunnel && !player.inShelter);
+    const surfaceMult = undergroundTunnel ? 0.12 : 1.0;
+
+    // Update Directional Key Light (follows player smoothly with crisp, acne-free shadow bias)
     const dir = dirLightRef.current;
     if (dir && player) {
       const useSun = sunElevation >= 0;
-      const lx = useSun ? sunHorizontal * 46 : -sunHorizontal * 42;
-      const ly = Math.max(12, Math.abs(sunElevation) * 52 + 10);
-      const lz = useSun ? -22 : 22;
+      const lx = useSun ? sunHorizontal * 48 : -sunHorizontal * 44;
+      const ly = Math.max(16, Math.abs(sunElevation) * 56 + 14);
+      const lz = useSun ? -26 : 26;
 
       dir.position.set(player.position.x + lx, ly, player.position.z + lz);
       dir.target.position.set(player.position.x, 0, player.position.z);
@@ -153,10 +156,10 @@ export function SkyAndLighting({ simRef, quality, isSoftwareGl }: SkyAndLighting
       if (useSun) {
         _sunColor.copy(SUN_GOLDEN).lerp(SUN_NOON, THREE.MathUtils.smoothstep(sunElevation, 0.02, 0.4));
         dir.color.copy(_sunColor);
-        dir.intensity = THREE.MathUtils.lerp(0.65, 2.35, dayFactor);
+        dir.intensity = THREE.MathUtils.lerp(0.75, 2.45, dayFactor) * surfaceMult;
       } else {
         dir.color.copy(MOON_LIGHT);
-        dir.intensity = 0.52;
+        dir.intensity = 0.58 * surfaceMult;
       }
 
       if (dir.shadow.mapSize.width !== shadowMapSize) {
@@ -166,23 +169,33 @@ export function SkyAndLighting({ simRef, quality, isSoftwareGl }: SkyAndLighting
       }
     }
 
-    // Cool sky / warm ground hemisphere fill
+    // Cool sky / warm ground hemisphere fill (lifted ground fill prevents black porch posts & harsh corners)
     const hemi = hemiLightRef.current;
     if (hemi) {
-      _hemiSky.set('#a8c4dc').lerp(_zenith, 0.45);
-      _hemiGround.set('#4c4439').lerp(NIGHT_ZENITH, (1 - dayFactor) * 0.65);
+      _hemiSky.set('#b4cee3').lerp(_zenith, 0.42);
+      _hemiGround.set('#62594d').lerp(NIGHT_ZENITH, (1 - dayFactor) * 0.62);
       hemi.color.copy(_hemiSky);
       hemi.groundColor.copy(_hemiGround);
-      hemi.intensity = THREE.MathUtils.lerp(0.32, 0.85, dayFactor);
+      hemi.intensity = undergroundTunnel ? 0.24 : THREE.MathUtils.lerp(0.42, 0.96, dayFactor);
     }
 
-    scene.environmentIntensity = THREE.MathUtils.lerp(0.18, 0.46, dayFactor);
+    // Soft warm interior architectural fill when player walks indoors (non-shadow-casting, 1 light budget)
+    const fill = interiorFillRef.current;
+    if (fill && player) {
+      const indoors = Boolean(player.insideHouseId && !player.inShelter && !player.inTunnel && player.currentFloor <= 1);
+      const targetIntensity = indoors ? THREE.MathUtils.lerp(2.4, 1.35, dayFactor) : 0;
+      fill.intensity += (targetIntensity - fill.intensity) * Math.min(1, delta * 6);
+      fill.position.set(player.position.x, player.position.y + 2.45, player.position.z);
+      fill.visible = fill.intensity > 0.02;
+    }
+
+    scene.environmentIntensity = undergroundTunnel ? 0.14 : THREE.MathUtils.lerp(0.24, 0.56, dayFactor);
   });
 
   return (
     <group>
       {/* Gradient Sky Dome */}
-      <mesh scale={[240, 240, 240]} frustumCulled={false}>
+      <mesh scale={[270, 270, 270]} frustumCulled={false}>
         <sphereGeometry args={[1, 24, 16]} />
         <shaderMaterial
           ref={skyMatRef}
@@ -205,25 +218,35 @@ export function SkyAndLighting({ simRef, quality, isSoftwareGl }: SkyAndLighting
         <meshBasicMaterial color="#d8e3f2" fog={false} />
       </mesh>
 
-      {/* Primary Key Light (shadows follow player tightly) */}
+      {/* Primary Key Light (shadows follow player tightly with crisp acne-free bias) */}
       <directionalLight
         ref={dirLightRef}
         castShadow={!isSoftwareGl}
-        intensity={2.1}
-        color="#fff2dc"
+        intensity={2.2}
+        color="#fff3de"
         shadow-mapSize={[shadowMapSize, shadowMapSize]}
         shadow-camera-near={2}
-        shadow-camera-far={130}
-        shadow-camera-left={-32}
-        shadow-camera-right={32}
-        shadow-camera-top={32}
-        shadow-camera-bottom={-32}
-        shadow-bias={-0.0005}
-        shadow-normalBias={0.025}
+        shadow-camera-far={145}
+        shadow-camera-left={-40}
+        shadow-camera-right={40}
+        shadow-camera-top={40}
+        shadow-camera-bottom={-40}
+        shadow-bias={-0.00025}
+        shadow-normalBias={0.038}
       />
 
-      {/* Cool Sky / Ground Fill */}
-      <hemisphereLight ref={hemiLightRef} args={['#9ec0dc', '#4c4439', 0.8]} />
+      {/* Cool Sky / Warm Ground Hemisphere Fill */}
+      <hemisphereLight ref={hemiLightRef} args={['#b4cee3', '#62594d', 0.92]} />
+
+      {/* Warm Interior Room Bounce Fill (active only inside houses) */}
+      <pointLight
+        ref={interiorFillRef}
+        color="#ffedd4"
+        intensity={0}
+        distance={18}
+        decay={1.8}
+        visible={false}
+      />
     </group>
   );
 }
