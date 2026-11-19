@@ -1,0 +1,6 @@
+{
+  "name": "Neighborhood Wars",
+  "description": "A 3D dark-comedy suburban survival and neighborhood-feud game built with Three.js and React.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
